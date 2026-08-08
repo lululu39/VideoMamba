@@ -1,16 +1,17 @@
 import torch
 from torch import optim as optim
 
-from timm.optim.adafactor import Adafactor
-from timm.optim.adahessian import Adahessian
-from timm.optim.adamp import AdamP
-from timm.optim.lookahead import Lookahead
-from timm.optim.nadam import Nadam
-# from timm.optim.novograd import NovoGrad
-from timm.optim.nvnovograd import NvNovoGrad
-from timm.optim.radam import RAdam
-from timm.optim.rmsprop_tf import RMSpropTF
-from timm.optim.sgdp import SGDP
+from timm.optim import (
+    Adafactor,
+    Adahessian,
+    AdamP,
+    Lookahead,
+    NAdam,
+    NvNovoGrad,
+    RAdam,
+    RMSpropTF,
+    SGDP,
+)
 
 import json
 
@@ -34,9 +35,9 @@ def get_num_layer_for_vit(var_name, num_max_layer):
     elif var_name.startswith("transformer.resblocks"):
         layer_id = int(var_name.split('.')[2])
         return layer_id + 1
-    # elif var_name.startswith("layers"): # for VideoMamba
-    #     layer_id = int(var_name.split('.')[1])
-    #     return layer_id + 1
+    elif var_name.startswith("layers"):
+        layer_id = int(var_name.split('.')[1])
+        return layer_id + 1
     elif var_name in ("class_embedding", "positional_embedding", "temporal_positional_embedding"):
         return 0
     elif var_name.startswith("conv1"):
@@ -144,7 +145,7 @@ def create_optimizer(
     elif opt_lower == 'adamw':
         optimizer = optim.AdamW(parameters, **opt_args)
     elif opt_lower == 'nadam':
-        optimizer = Nadam(parameters, **opt_args)
+        optimizer = NAdam(parameters, **opt_args)
     elif opt_lower == 'radam':
         optimizer = RAdam(parameters, **opt_args)
     elif opt_lower == 'adamp':

@@ -350,6 +350,21 @@ def main(args, ds_init):
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )
+    elif 'videovit' in args.model:
+        model = create_model(
+            args.model,
+            img_size=args.input_size,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            fc_drop_rate=args.fc_drop_rate,
+            drop_rate=args.drop,
+            attn_drop_rate=args.attn_drop_rate,
+            drop_path_rate=args.drop_path,
+            kernel_size=args.tubelet_size,
+            num_frames=args.num_frames,
+            use_checkpoint=args.use_checkpoint,
+            checkpoint_num=args.checkpoint_num,
+        )
     else:
         model = create_model(
             args.model,
@@ -421,7 +436,7 @@ def main(args, ds_init):
         checkpoint_model = new_dict
 
         # interpolate position embedding
-        if 'deit' in args.model or 'videomamba' in args.model:
+        if any(name in args.model for name in ('deit', 'videomamba', 'videovit')):
             pos_embed_checkpoint = checkpoint_model['pos_embed']
             embedding_size = pos_embed_checkpoint.shape[-1] # channel dim
             num_patches = model.patch_embed.num_patches # 

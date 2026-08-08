@@ -1,5 +1,35 @@
 # Single-modality Video Understanding
 
+## VideoViT Architecture Comparison
+
+`models/videovit.py` provides independent `videovit_tiny`, `videovit_small`,
+and `videovit_middle` models. They preserve the corresponding VideoMamba 3D
+tubelet embedding, width, depth, RMSNorm, residual path, spatial and temporal
+position embeddings, and classification head. The bidirectional Mamba sequence
+mixer is replaced by multi-head scaled dot-product softmax attention. No MLP
+branch is added, so the experiment changes the sequence mixer rather than the
+whole block.
+
+Create the tested environment from the repository's `videomamba` directory, or
+activate the already-created local environment:
+
+```shell
+conda env create -f environment-videovit.yml
+conda activate videovit
+```
+
+Use the existing classification or regression command with a VideoViT model
+name, for example:
+
+```shell
+python run_class_finetuning.py --model videovit_tiny <your existing video arguments>
+```
+
+`--drop`, `--attn_drop_rate`, `--drop_path`, `--tubelet_size`, `--num_frames`,
+`--use_checkpoint`, and `--checkpoint_num` are supported. VideoViT does not
+currently provide pretrained checkpoints; train from scratch or pass a
+compatible checkpoint with `--finetune`.
+
 We currenent release the code and models for:
 
 - [x] **Masked Pretraining**

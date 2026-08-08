@@ -15,12 +15,19 @@ from .modeling_pretrain import (
     pretrain_videomae_huge_patch16_224 
 )
 from .deit import deit_tiny_patch16_224
-from .videomamba import (
-    videomamba_tiny, 
-    videomamba_small, 
-    videomamba_middle, 
+from .videovit import (
+    videovit_tiny,
+    videovit_small,
+    videovit_middle,
 )
 
-from .videomamba_pretrain import (
-    videomamba_middle_pretrain
-)
+try:
+    from .videomamba import (
+        videomamba_tiny,
+        videomamba_small,
+        videomamba_middle,
+    )
+    from .videomamba_pretrain import videomamba_middle_pretrain
+except ModuleNotFoundError as error:
+    if error.name is None or not error.name.startswith("mamba_ssm"):
+        raise

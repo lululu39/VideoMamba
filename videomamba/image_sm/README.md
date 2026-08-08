@@ -1,5 +1,32 @@
 # Image Classification
 
+## VideoViT Architecture Comparison
+
+`models/videovit.py` provides independent `videovit_tiny`, `videovit_small`,
+`videovit_middle`, and `videovit_base` models. They preserve the corresponding
+VideoMamba patch embedding, width, depth, RMSNorm, residual path, position
+embedding, and classification head. The bidirectional Mamba sequence mixer is
+replaced by multi-head scaled dot-product softmax attention. No MLP branch is
+added, so the experiment changes the sequence mixer rather than the whole
+block.
+
+Create the tested environment from the repository's `videomamba` directory, or
+activate the already-created local environment:
+
+```shell
+conda env create -f environment-videovit.yml
+conda activate videovit
+```
+
+Use the existing training commands with a VideoViT model name, for example:
+
+```shell
+python main.py --model videovit_tiny <your existing ImageNet arguments>
+```
+
+VideoViT does not currently provide pretrained checkpoints; train from scratch
+or pass a compatible checkpoint with `--finetune`.
+
 We currenent release the code and models for:
 
 - [x] **ImageNet-1K pretraining**
@@ -66,5 +93,4 @@ python3 generate_tensoboard.py
 ```
 
 Note that you should install `tensorboardX`.
-
 

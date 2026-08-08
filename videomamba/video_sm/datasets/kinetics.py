@@ -2,7 +2,6 @@ import os
 import os
 import io
 import numpy as np
-from numpy.lib.function_base import disp
 import torch
 from torchvision import transforms
 import warnings
@@ -402,4 +401,3 @@ def tensor_normalize(tensor, mean, std):
     tensor = tensor - mean
     tensor = tensor / std
     return tensor
-
