@@ -101,6 +101,22 @@
   `imagenet-1k/meta/val.txt`。启动完整训练前要检查 1,281,167 个 train 样本、
   50,000 个 validation 样本，并用仓库 DataLoader 实际读取样本。
 
+## 实验输出规则
+
+- ImageNet-1K 预训练 checkpoint 和运行日志严禁写入仓库。每个 run 使用
+  `/mnt/localssd/experiments/videovit/<run-name>` 独立目录，checkpoint 写到其
+  `ckpt/` 子目录，终端日志和 PID 文件写到 run 根目录。
+- 本机单节点八卡训练使用 `torchrun --nnodes=1 --nproc-per-node=8`，启动前必须确认
+  八张 H100 空闲。脚本应从任意工作目录都能运行，并激活 `videovit` Conda 环境。
+- 当前 ImageNet-1K VideoViT-Middle 标准预训练 run 为
+  `video-vit-middle-imagenet-1k-pretrain`，入口脚本是
+  `videomamba/image_sm/exp/videovit_middle/run224.sh`。它使用普通 `main.py`，不使用
+  teacher 或 `main_distill.py`；每卡 batch 128，八卡 global batch 1024。普通入口会
+  按 global batch/512 缩放 base LR，因此 `--lr 5e-4` 对应实际 peak LR `1e-3`。
+- `exp_distill/videomamba_middle` 是原作者给 VideoMamba-Middle/Base 提供的特征蒸馏
+  recipe，不是 middle 模型的代码限制。除非用户明确要求，VideoViT 的标准图像预训练
+  不得因为模型名是 middle 而自动切换到 distill 入口。
+
 ## Weights & Biases 规则
 
 - image VideoViT 训练、视频分类 SFT 和视频回归 SFT 均支持 W&B；只允许主 rank
