@@ -85,6 +85,22 @@
   `pretrained_cfg_overlay`、`cache_dir`。不要让模型构造函数静默吞掉任意
   `**kwargs`，否则参数拼写错误不会被发现。
 
+## ImageNet-1K 数据规则
+
+- 数据源使用 Hugging Face gated dataset `ILSVRC/imagenet-1k`。只下载有标签的
+  train 和 validation，不下载测试集；下载前必须确保当前 Hugging Face 账号已接受
+  数据集条款，token 只能从本机安全配置读取，严禁写入仓库或打印到日志。
+- 原始 Parquet 固定放在
+  `/mnt/localssd/dataset/videovit/imagenet-1k-hf`，展开后的训练数据固定放在
+  `/mnt/localssd/dataset/videovit/imagenet-1k`。
+- 本仓库的 `ImageNetDataset` 不使用 torchvision `ImageFolder` 自动推断类别，必须
+  分别传入图片 root 和 `相对路径 整数标签` 格式的 meta 文件。转换脚本为
+  `videomamba/image_sm/prepare_imagenet_hf.py`，支持按 shard 中断恢复并检查官方样本数。
+- 训练参数固定对应为：train root `imagenet-1k/train`、train meta
+  `imagenet-1k/meta/train.txt`、validation root `imagenet-1k/val`、validation meta
+  `imagenet-1k/meta/val.txt`。启动完整训练前要检查 1,281,167 个 train 样本、
+  50,000 个 validation 样本，并用仓库 DataLoader 实际读取样本。
+
 ## Weights & Biases 规则
 
 - image VideoViT 训练、视频分类 SFT 和视频回归 SFT 均支持 W&B；只允许主 rank
@@ -125,5 +141,9 @@
 - W&B：已用 offline run 验证 image/video logger 生命周期、batch/epoch scalar
   上报、CLI 默认 entity/project、run name 必填、`WANDB_BASE_URL` 清除后选择
   `https://api.wandb.ai`，以及非主 rank 不初始化 run。
+- ImageNet-1K：HF train/validation 的 308 个 Parquet shard 已完整下载并展开；文件数与
+  meta 行数分别为 1,281,167 和 50,000，两个 split 都覆盖 1000 类。转换脚本已验证
+  shard 级恢复，仓库真实增强和 8-worker DataLoader 已分别读取 train/validation 的
+  `64x3x224x224` batch。
 - 通用：AdamW/NAdam 构造、layer decay、compileall、Conda YAML dry-run 和 Git
   whitespace 检查。

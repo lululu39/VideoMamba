@@ -18,6 +18,39 @@ conda env create -f environment-videovit.yml
 conda activate videovit
 ```
 
+### ImageNet-1K data
+
+The training loader expects filesystem images plus metadata lines in
+`relative/image/path.JPEG integer_label` format. The Hugging Face
+`ILSVRC/imagenet-1k` dataset is gated, so accept its terms and authenticate with
+`hf auth login` before downloading the labeled splits:
+
+```shell
+export HF_HOME=/mnt/localssd/dataset/videovit/.hf_home
+hf download ILSVRC/imagenet-1k \
+    --repo-type dataset \
+    --include 'data/train-*.parquet' \
+    --include 'data/validation-*.parquet' \
+    --include classes.py \
+    --include README.md \
+    --local-dir /mnt/localssd/dataset/videovit/imagenet-1k-hf \
+    --max-workers 16
+
+python prepare_imagenet_hf.py \
+    --source /mnt/localssd/dataset/videovit/imagenet-1k-hf \
+    --output /mnt/localssd/dataset/videovit/imagenet-1k \
+    --workers 8
+```
+
+The converter is resumable at shard granularity. Train with:
+
+```shell
+--root_dir_train /mnt/localssd/dataset/videovit/imagenet-1k/train \
+--meta_file_train /mnt/localssd/dataset/videovit/imagenet-1k/meta/train.txt \
+--root_dir_val /mnt/localssd/dataset/videovit/imagenet-1k/val \
+--meta_file_val /mnt/localssd/dataset/videovit/imagenet-1k/meta/val.txt
+```
+
 Use the existing training commands with a VideoViT model name, for example:
 
 ```shell
