@@ -400,6 +400,31 @@ def load_state_dict(model, state_dict, prefix='', ignore_missing="relative_posit
         print('\n'.join(error_msgs))
 
 
+def adapt_image_checkpoint_for_video(model, state_dict):
+    """Adapt image ViT patch/head tensors before loading a video model."""
+    state_dict = state_dict.copy()
+    model_state = model.state_dict()
+
+    patch_key = "patch_embed.proj.weight"
+    if patch_key in state_dict and patch_key in model_state:
+        image_weight = state_dict[patch_key]
+        video_weight = model_state[patch_key]
+        if image_weight.ndim == 4 and video_weight.ndim == 5:
+            inflated = image_weight.new_zeros(video_weight.shape)
+            inflated[:, :, video_weight.shape[2] // 2] = image_weight
+            state_dict[patch_key] = inflated
+
+    for head_key in ("head.weight", "head.bias"):
+        if (
+            head_key in state_dict
+            and head_key in model_state
+            and state_dict[head_key].shape != model_state[head_key].shape
+        ):
+            del state_dict[head_key]
+
+    return state_dict
+
+
 class NativeScalerWithGradNormCount:
     state_dict_key = "amp_scaler"
 

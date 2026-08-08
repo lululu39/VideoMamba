@@ -51,8 +51,25 @@ class SoftmaxAttention(nn.Module):
         return self.proj_drop(self.out_proj(x))
 
 
+class SwiGLUMLP(nn.Module):
+    """Bias-free slow MLP matching the LACT reference implementation."""
+
+    def __init__(self, dim, mlp_ratio=3.0, device=None, dtype=None):
+        super().__init__()
+        if mlp_ratio <= 0:
+            raise ValueError(f"mlp_ratio must be positive, got {mlp_ratio}")
+        factory_kwargs = {"device": device, "dtype": dtype}
+        hidden_dim = int(dim * mlp_ratio)
+        self.gate = nn.Linear(dim, hidden_dim, bias=False, **factory_kwargs)
+        self.up = nn.Linear(dim, hidden_dim, bias=False, **factory_kwargs)
+        self.down = nn.Linear(hidden_dim, dim, bias=False, **factory_kwargs)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
 class Block(nn.Module):
-    """VideoMamba residual block with attention as the sequence mixer."""
+    """Pre-norm softmax attention followed by a slow SwiGLU MLP."""
 
     def __init__(
         self,
@@ -64,6 +81,7 @@ class Block(nn.Module):
         attn_drop=0.0,
         proj_drop=0.0,
         qkv_bias=True,
+        mlp_ratio=3.0,
         device=None,
         dtype=None,
     ):
@@ -79,33 +97,36 @@ class Block(nn.Module):
             **factory_kwargs,
         )
         self.norm = norm_cls(dim, **factory_kwargs)
+        self.norm_mlp = norm_cls(dim, **factory_kwargs)
+        self.mlp = SwiGLUMLP(dim, mlp_ratio=mlp_ratio, **factory_kwargs)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(
         self,
         hidden_states,
-        residual=None,
         inference_params=None,
         use_checkpoint=False,
     ):
         del inference_params
-        residual = (
-            residual + self.drop_path(hidden_states)
-            if residual is not None
-            else hidden_states
-        )
-        hidden_states = self.norm(residual.to(dtype=self.norm.weight.dtype))
-        if self.residual_in_fp32:
-            residual = residual.float()
+
+        def forward_block(x):
+            x = x + self.drop_path(
+                self.mixer(self.norm(x.to(dtype=self.norm.weight.dtype)))
+            )
+            x = x + self.drop_path(
+                self.mlp(
+                    self.norm_mlp(x.to(dtype=self.norm_mlp.weight.dtype))
+                )
+            )
+            return x.float() if self.residual_in_fp32 else x
+
         if use_checkpoint:
-            hidden_states = checkpoint.checkpoint(
-                self.mixer,
+            return checkpoint.checkpoint(
+                forward_block,
                 hidden_states,
                 use_reentrant=False,
             )
-        else:
-            hidden_states = self.mixer(hidden_states)
-        return hidden_states, residual
+        return forward_block(hidden_states)
 
 
 def _init_weights(
@@ -187,6 +208,7 @@ class VisionTransformer(nn.Module):
         depth=24,
         embed_dim=192,
         num_heads=3,
+        mlp_ratio=3.0,
         channels=3,
         num_classes=1000,
         drop_rate=0.0,
@@ -267,6 +289,7 @@ class VisionTransformer(nn.Module):
                     attn_drop=attn_drop_rate,
                     proj_drop=drop_rate,
                     qkv_bias=qkv_bias,
+                    mlp_ratio=mlp_ratio,
                     **factory_kwargs,
                 )
                 for index in range(depth)
@@ -327,18 +350,15 @@ class VisionTransformer(nn.Module):
         )
         hidden_states = self.pos_drop(torch.cat((cls_tokens, x), dim=1))
 
-        residual = None
         for index, layer in enumerate(self.layers):
-            hidden_states, residual = layer(
+            hidden_states = layer(
                 hidden_states,
-                residual,
                 inference_params=inference_params,
                 use_checkpoint=self.use_checkpoint and index < self.checkpoint_num,
             )
 
-        residual = residual + self.drop_path(hidden_states)
         hidden_states = self.norm_f(
-            residual.to(dtype=self.norm_f.weight.dtype)
+            hidden_states.to(dtype=self.norm_f.weight.dtype)
         )
         return hidden_states[:, 0]
 

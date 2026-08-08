@@ -35,7 +35,12 @@ def get_args():
     # Model parameters
     parser.add_argument('--model', default='vit_base_patch16_224', type=str, metavar='MODEL',
                         help='Name of model to train')
-    parser.add_argument('--tubelet_size', type=int, default=2)
+    parser.add_argument(
+        '--tubelet_size',
+        type=int,
+        default=None,
+        help='Tubelet size (default: 1 for VideoLACT, 2 otherwise)',
+    )
     parser.add_argument('--orig_t_size', type=int, default=8)
     parser.add_argument('--input_size', default=224, type=int,
                         help='videos input size')
@@ -50,6 +55,11 @@ def get_args():
                         help='Attention dropout rate (default: 0.)')
     parser.add_argument('--drop_path', type=float, default=0.1, metavar='PCT',
                         help='Drop path rate (default: 0.1)')
+    parser.add_argument('--mlp_ratio', type=float, default=3.0)
+    parser.add_argument('--fw_inter_multi', type=float, default=2.0)
+    parser.add_argument('--fw_num_heads', type=int, default=1)
+    parser.add_argument('--fw_base_lr', type=float, default=0.01)
+    parser.add_argument('--muon_update_steps', type=int, default=5)
 
     parser.add_argument('--disable_eval_during_finetuning', action='store_true', default=False)
     parser.add_argument('--model_ema', action='store_true', default=False)
@@ -226,7 +236,10 @@ def get_args():
     else:
         ds_init = None
 
-    return parser.parse_args(), ds_init
+    args = parser.parse_args()
+    if args.tubelet_size is None:
+        args.tubelet_size = 1 if 'videolact' in args.model else 2
+    return args, ds_init
 
 
 def main(args, ds_init):
@@ -360,8 +373,29 @@ def main(args, ds_init):
             drop_rate=args.drop,
             attn_drop_rate=args.attn_drop_rate,
             drop_path_rate=args.drop_path,
+            mlp_ratio=args.mlp_ratio,
             kernel_size=args.tubelet_size,
             num_frames=args.num_frames,
+            use_checkpoint=args.use_checkpoint,
+            checkpoint_num=args.checkpoint_num,
+        )
+    elif 'videolact' in args.model:
+        model = create_model(
+            args.model,
+            img_size=args.input_size,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            fc_drop_rate=args.fc_drop_rate,
+            drop_rate=args.drop,
+            attn_drop_rate=args.attn_drop_rate,
+            drop_path_rate=args.drop_path,
+            mlp_ratio=args.mlp_ratio,
+            kernel_size=args.tubelet_size,
+            num_frames=args.num_frames,
+            fw_inter_multi=args.fw_inter_multi,
+            fw_num_heads=args.fw_num_heads,
+            fw_base_lr=args.fw_base_lr,
+            muon_update_steps=args.muon_update_steps,
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )
@@ -434,9 +468,12 @@ def main(args, ds_init):
             else:
                 new_dict[key] = checkpoint_model[key]
         checkpoint_model = new_dict
+        checkpoint_model = utils.adapt_image_checkpoint_for_video(
+            model, checkpoint_model
+        )
 
         # interpolate position embedding
-        if any(name in args.model for name in ('deit', 'videomamba', 'videovit')):
+        if any(name in args.model for name in ('deit', 'videomamba', 'videovit', 'videolact')):
             pos_embed_checkpoint = checkpoint_model['pos_embed']
             embedding_size = pos_embed_checkpoint.shape[-1] # channel dim
             num_patches = model.patch_embed.num_patches # 
@@ -460,19 +497,18 @@ def main(args, ds_init):
                 new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
                 checkpoint_model['pos_embed'] = new_pos_embed
             
-            # we use 8 frames for pretraining
-            temporal_pos_embed = checkpoint_model['temporal_pos_embedding']
-            orig_t_size = args.orig_t_size // model.patch_embed.tubelet_size
-            new_t_size = args.num_frames // model.patch_embed.tubelet_size
-            # height (== width) for the checkpoint position embedding
-            if orig_t_size != new_t_size:
-                print(f"Temporal interpolate from {orig_t_size} to {new_t_size}")
-                temporal_pos_embed = temporal_pos_embed.permute(0, 2, 1)
-                temporal_pos_embed = torch.nn.functional.interpolate(
-                    temporal_pos_embed, size=(new_t_size,), mode='linear', align_corners=False
-                )
-                temporal_pos_embed = temporal_pos_embed.permute(0, 2, 1)
-                checkpoint_model['temporal_pos_embedding'] = temporal_pos_embed
+            if 'temporal_pos_embedding' in checkpoint_model:
+                temporal_pos_embed = checkpoint_model['temporal_pos_embedding']
+                orig_t_size = temporal_pos_embed.shape[1]
+                new_t_size = args.num_frames // model.patch_embed.tubelet_size
+                if orig_t_size != new_t_size:
+                    print(f"Temporal interpolate from {orig_t_size} to {new_t_size}")
+                    temporal_pos_embed = temporal_pos_embed.permute(0, 2, 1)
+                    temporal_pos_embed = torch.nn.functional.interpolate(
+                        temporal_pos_embed, size=(new_t_size,), mode='linear', align_corners=False
+                    )
+                    temporal_pos_embed = temporal_pos_embed.permute(0, 2, 1)
+                    checkpoint_model['temporal_pos_embedding'] = temporal_pos_embed
 
         elif 'pos_embed' in checkpoint_model:
             pos_embed_checkpoint = checkpoint_model['pos_embed']

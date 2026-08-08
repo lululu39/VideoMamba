@@ -47,6 +47,8 @@ def get_args_parser():
                         help='Dropout rate (default: 0.)')
     parser.add_argument('--drop-path', type=float, default=0.1, metavar='PCT',
                         help='Drop path rate (default: 0.1)')
+    parser.add_argument('--mlp-ratio', type=float, default=3.0,
+                        help='Slow SwiGLU hidden dimension ratio (default: 3.0)')
 
     parser.add_argument('--model-ema', action='store_true')
     parser.add_argument('--no-model-ema', action='store_false', dest='model_ema')
@@ -283,6 +285,7 @@ def main(args):
         num_classes=args.nb_classes,
         drop_rate=args.drop,
         drop_path_rate=args.drop_path,
+        **({'mlp_ratio': args.mlp_ratio} if 'videovit' in args.model else {}),
         drop_block_rate=None,
         img_size=args.input_size,
     )

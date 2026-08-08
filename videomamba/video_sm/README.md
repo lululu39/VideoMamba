@@ -5,10 +5,9 @@
 `models/videovit.py` provides independent `videovit_tiny`, `videovit_small`,
 and `videovit_middle` models. They preserve the corresponding VideoMamba 3D
 tubelet embedding, width, depth, RMSNorm, residual path, spatial and temporal
-position embeddings, and classification head. The bidirectional Mamba sequence
-mixer is replaced by multi-head scaled dot-product softmax attention. No MLP
-branch is added, so the experiment changes the sequence mixer rather than the
-whole block.
+position embeddings, and classification head. Each pre-norm block uses
+multi-head scaled dot-product softmax attention followed by the reference
+bias-free slow SwiGLU MLP.
 
 Create the tested environment from the repository's `videomamba` directory, or
 activate the already-created local environment:
@@ -25,10 +24,41 @@ name, for example:
 python run_class_finetuning.py --model videovit_tiny <your existing video arguments>
 ```
 
-`--drop`, `--attn_drop_rate`, `--drop_path`, `--tubelet_size`, `--num_frames`,
+`--drop`, `--attn_drop_rate`, `--drop_path`, `--mlp_ratio`, `--tubelet_size`, `--num_frames`,
 `--use_checkpoint`, and `--checkpoint_num` are supported. VideoViT does not
 currently provide pretrained checkpoints; train from scratch or pass a
 compatible checkpoint with `--finetune`.
+
+### VideoLACT
+
+`models/videolact.py` provides `videolact_tiny`, `videolact_small`, and
+`videolact_middle`. A LACT block replaces VideoViT's global attention with
+per-tubelet window softmax attention followed by a separate SwiGLU fast-weight
+memory. It then runs the same slow SwiGLU MLP as VideoViT. Each embedded tubelet
+(one CLS token plus its spatial patch tokens) is applied through all blocks
+before every block updates its fast weights with five Muon Newton-Schulz
+iterations. The next tubelet sees the updated memory, and the final tubelet CLS
+token is used for prediction.
+
+The window-attention `qkv` and output projection retain the image VideoViT key
+names. Fast-weight apply, update-key, value, learning-rate, and output
+projections are separate parameters. This allows an image `videovit_*`
+checkpoint to initialize the spatial stem, tokens, position embedding, window
+attention, slow MLP, final norm, and compatible head while leaving LACT-only
+parameters newly initialized. The training loader center-inflates the image
+patch kernel into the video tubelet kernel.
+
+```shell
+python run_class_finetuning.py --model videolact_tiny \
+    --finetune /path/to/image_videovit_checkpoint.pth \
+    <your existing video arguments>
+```
+
+LACT defaults match the reference implementation: `--mlp_ratio 3`,
+`--fw_inter_multi 2`, `--fw_num_heads 1`, `--fw_base_lr 0.01`, and
+`--muon_update_steps 5`. VideoLACT defaults to `--tubelet_size 1`; larger values
+are supported when they divide `num_frames`, with one apply/update per embedded
+tubelet. Other models keep the training scripts' existing default of 2.
 
 We currenent release the code and models for:
 

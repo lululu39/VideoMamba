@@ -20,6 +20,11 @@ from .videovit import (
     videovit_small,
     videovit_middle,
 )
+from .videolact import (
+    videolact_tiny,
+    videolact_small,
+    videolact_middle,
+)
 
 try:
     from .videomamba import (

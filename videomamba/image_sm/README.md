@@ -6,9 +6,9 @@
 `videovit_middle`, and `videovit_base` models. They preserve the corresponding
 VideoMamba patch embedding, width, depth, RMSNorm, residual path, position
 embedding, and classification head. The bidirectional Mamba sequence mixer is
-replaced by multi-head scaled dot-product softmax attention. No MLP branch is
-added, so the experiment changes the sequence mixer rather than the whole
-block.
+replaced by multi-head scaled dot-product softmax attention, followed by the
+reference bias-free slow SwiGLU MLP. Its hidden ratio is configurable with
+`--mlp-ratio` and defaults to 3.
 
 Create the tested environment from the repository's `videomamba` directory, or
 activate the already-created local environment:
@@ -93,4 +93,3 @@ python3 generate_tensoboard.py
 ```
 
 Note that you should install `tensorboardX`.
-
