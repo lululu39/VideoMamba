@@ -4,7 +4,7 @@
 
 - 本仓库用于比较 VideoMamba、VideoViT 和 VideoLACT 在图像预训练、视频监督训练下的架构能力。
 - 新架构必须作为独立模型实现。不要在 VideoMamba 或 VideoViT 中加入切换 mixer 的模式开关。
-- 当前改动只保留在本地 `main`，按仓库所有者要求不要推送。
+- 默认不推送；只有用户在当前任务明确要求时才允许 push。
 
 ## VideoViT
 
@@ -17,7 +17,10 @@
   参考实现一致。
 - image/video VideoViT 的 block 参数名和运算完全一致；视频版只额外处理 3D
   tubelet embedding 与时间位置编码。
-- tiny/small/middle/base 分别使用 3/6/9/12 个 attention head，head dim 固定为 64。
+- tiny/small/middle/base 分别使用 3/6/9/12 个 attention head。tiny/small/base 的
+  head dim 为 64；middle 使用规整的 `dim=432`、`depth=32`，head dim 为 48，
+  Image/Video ViT 参数量约 78.6M。Image VideoViT、VideoViT 和 VideoLACT 的
+  middle 配置必须同步，保证 image checkpoint 的共享参数形状兼容。
 
 ## VideoLACT
 
@@ -113,6 +116,8 @@
   `videomamba/image_sm/exp/videovit_middle/run224.sh`。它使用普通 `main.py`，不使用
   teacher 或 `main_distill.py`；每卡 batch 128，八卡 global batch 1024。普通入口会
   按 global batch/512 缩放 base LR，因此 `--lr 5e-4` 对应实际 peak LR `1e-3`。
+- 该 run 最初误用 `dim=576` 启动出 139.3M ViT；发现后已在首个 epoch 完成前停止，
+  不得从该尝试恢复。正式 run 必须使用 `dim=432` 的约 78.6M 模型并从头训练。
 - `exp_distill/videomamba_middle` 是原作者给 VideoMamba-Middle/Base 提供的特征蒸馏
   recipe，不是 middle 模型的代码限制。除非用户明确要求，VideoViT 的标准图像预训练
   不得因为模型名是 middle 而自动切换到 distill 入口。
@@ -154,6 +159,9 @@
   真实尺寸推理。
 - Image ViT 初始化：VideoViT 和 VideoLACT 都已验证 2D patch kernel 中心膨胀、
   window QKV 逐值加载、类别头跳过以及 LACT-only 参数保持新初始化。
+- Middle 缩放：`dim=432`、`depth=32`、9 heads 配置下，Image ViT 为
+  78,569,704 参数，VideoViT 为 78,573,160 参数，VideoLACT 为 138,348,136 参数；
+  image checkpoint 与两个视频模型的 78,237,928 个共享参数形状已逐项验证兼容。
 - W&B：已用 offline run 验证 image/video logger 生命周期、batch/epoch scalar
   上报、CLI 默认 entity/project、run name 必填、`WANDB_BASE_URL` 清除后选择
   `https://api.wandb.ai`，以及非主 rank 不初始化 run。

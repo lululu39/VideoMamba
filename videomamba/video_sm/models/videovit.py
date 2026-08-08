@@ -406,7 +406,7 @@ def videovit_middle(pretrained=False, **kwargs):
     return _create_videovit(
         pretrained=pretrained,
         patch_size=16,
-        embed_dim=576,
+        embed_dim=432,
         depth=32,
         num_heads=9,
         **kwargs,

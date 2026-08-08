@@ -4,10 +4,12 @@
 
 `models/videovit.py` provides independent `videovit_tiny`, `videovit_small`,
 and `videovit_middle` models. They preserve the corresponding VideoMamba 3D
-tubelet embedding, width, depth, RMSNorm, residual path, spatial and temporal
-position embeddings, and classification head. Each pre-norm block uses
-multi-head scaled dot-product softmax attention followed by the reference
-bias-free slow SwiGLU MLP.
+tubelet embedding, depth, RMSNorm, residual path, spatial and temporal position
+embeddings, and classification head. Each pre-norm block uses multi-head scaled
+dot-product softmax attention followed by the reference bias-free slow SwiGLU
+MLP. Image VideoViT, VideoViT, and VideoLACT Middle all use `dim=432`,
+`depth=32`, and 9 attention heads so their shared checkpoint tensors remain
+compatible.
 
 Create the tested environment from the repository's `videomamba` directory, or
 activate the already-created local environment:

@@ -4,11 +4,12 @@
 
 `models/videovit.py` provides independent `videovit_tiny`, `videovit_small`,
 `videovit_middle`, and `videovit_base` models. They preserve the corresponding
-VideoMamba patch embedding, width, depth, RMSNorm, residual path, position
-embedding, and classification head. The bidirectional Mamba sequence mixer is
-replaced by multi-head scaled dot-product softmax attention, followed by the
-reference bias-free slow SwiGLU MLP. Its hidden ratio is configurable with
-`--mlp-ratio` and defaults to 3.
+VideoMamba patch embedding, depth, RMSNorm, residual path, position embedding,
+and classification head. The bidirectional Mamba sequence mixer is replaced by
+multi-head scaled dot-product softmax attention, followed by the reference
+bias-free slow SwiGLU MLP. Its hidden ratio is configurable with `--mlp-ratio`
+and defaults to 3. Middle uses a regular 432-wide, 9-head configuration so the
+ViT remains in the roughly 80M-parameter model class.
 
 Create the tested environment from the repository's `videomamba` directory, or
 activate the already-created local environment:
