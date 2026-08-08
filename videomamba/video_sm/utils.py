@@ -248,6 +248,101 @@ class TensorboardLogger(object):
         self.writer.flush()
 
 
+class WandbLogger(object):
+    """Main-process W&B logger for public wandb.ai runs."""
+
+    def __init__(self, args):
+        if not args.wandb_run_name:
+            raise ValueError("--wandb_run_name is required when --wandb is set")
+
+        os.environ.pop("WANDB_BASE_URL", None)
+        print("unset WANDB_BASE_URL  # use public wandb.ai")
+
+        import wandb
+
+        init_kwargs = {
+            "entity": args.wandb_entity,
+            "project": args.wandb_project,
+            "name": args.wandb_run_name,
+            "config": vars(args),
+        }
+        if args.output_dir:
+            init_kwargs["dir"] = args.output_dir
+        self.run = wandb.init(**init_kwargs)
+        self.step = 0
+        self.pending = {}
+
+        self.run.define_metric("trainer/global_step")
+        self.run.define_metric("loss/*", step_metric="trainer/global_step")
+        self.run.define_metric("opt/*", step_metric="trainer/global_step")
+        self.run.define_metric("epoch")
+        self.run.define_metric("perf/*", step_metric="epoch")
+        for prefix in ("train_*", "val_*", "test_*"):
+            self.run.define_metric(prefix, step_metric="epoch")
+
+    @staticmethod
+    def _as_scalar(value):
+        if isinstance(value, torch.Tensor):
+            value = value.item()
+        if isinstance(value, np.generic):
+            value = value.item()
+        return value
+
+    def _flush_pending(self):
+        if not self.pending:
+            return
+        self.run.log({"trainer/global_step": self.step, **self.pending})
+        self.pending.clear()
+
+    def set_step(self, step=None):
+        self._flush_pending()
+        self.step = self.step + 1 if step is None else step
+
+    def update(self, head="scalar", step=None, **kwargs):
+        metrics = {
+            f"{head}/{key}": self._as_scalar(value)
+            for key, value in kwargs.items()
+            if value is not None
+        }
+        if step is None:
+            self.pending.update(metrics)
+        else:
+            self.run.log({"epoch": step, **metrics})
+
+    def log(self, metrics, step=None):
+        self._flush_pending()
+        payload = {
+            key: self._as_scalar(value) for key, value in metrics.items()
+        }
+        if step is not None:
+            payload["epoch"] = step
+        self.run.log(payload)
+
+    def flush(self):
+        self._flush_pending()
+
+    def finish(self):
+        self._flush_pending()
+        self.run.finish()
+
+
+class CompositeLogger(object):
+    def __init__(self, loggers):
+        self.loggers = loggers
+
+    def set_step(self, step=None):
+        for logger in self.loggers:
+            logger.set_step(step)
+
+    def update(self, head="scalar", step=None, **kwargs):
+        for logger in self.loggers:
+            logger.update(head=head, step=step, **kwargs)
+
+    def flush(self):
+        for logger in self.loggers:
+            logger.flush()
+
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
@@ -301,6 +396,12 @@ def get_rank():
 
 def is_main_process():
     return get_rank() == 0
+
+
+def init_wandb(args):
+    if not getattr(args, "wandb", False) or not is_main_process():
+        return None
+    return WandbLogger(args)
 
 
 def save_on_master(obj, ckpt_path):

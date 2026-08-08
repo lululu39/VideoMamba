@@ -60,6 +60,26 @@ LACT defaults match the reference implementation: `--mlp_ratio 3`,
 are supported when they divide `num_frames`, with one apply/update per embedded
 tubelet. Other models keep the training scripts' existing default of 2.
 
+### Weights & Biases
+
+Classification and regression SFT report batch-level loss/optimization metrics
+plus epoch-level train, validation, and final metrics to the public W&B project
+`LVSM-Experiment/videosft`. A run name is intentionally required for every
+launch:
+
+```shell
+unset WANDB_BASE_URL
+python run_class_finetuning.py \
+    --model videolact_tiny \
+    --wandb \
+    --wandb_run_name <run-name> \
+    <your existing video arguments>
+```
+
+The same options work with `run_regression_finetuning.py`. Only distributed
+rank 0 creates a W&B run. The code also clears `WANDB_BASE_URL` immediately
+before `wandb.init`; it does not modify or print `WANDB_API_KEY`.
+
 We currenent release the code and models for:
 
 - [x] **Masked Pretraining**

@@ -15,6 +15,35 @@ import torch
 import torch.distributed as dist
 
 
+class WandbLogger(object):
+    """Main-process W&B logger for public wandb.ai runs."""
+
+    def __init__(self, args):
+        if not args.wandb_run_name:
+            raise ValueError("--wandb-run-name is required when --wandb is set")
+
+        os.environ.pop("WANDB_BASE_URL", None)
+        print("unset WANDB_BASE_URL  # use public wandb.ai")
+
+        import wandb
+
+        init_kwargs = {
+            "entity": args.wandb_entity,
+            "project": args.wandb_project,
+            "name": args.wandb_run_name,
+            "config": vars(args),
+        }
+        if args.output_dir:
+            init_kwargs["dir"] = args.output_dir
+        self.run = wandb.init(**init_kwargs)
+
+    def log(self, metrics, step=None):
+        self.run.log(metrics, step=step)
+
+    def finish(self):
+        self.run.finish()
+
+
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
     window or the global series average.
@@ -206,6 +235,12 @@ def get_rank():
 
 def is_main_process():
     return get_rank() == 0
+
+
+def init_wandb(args):
+    if not getattr(args, "wandb", False) or not is_main_process():
+        return None
+    return WandbLogger(args)
 
 
 def save_on_master(*args, **kwargs):

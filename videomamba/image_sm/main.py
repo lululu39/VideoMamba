@@ -173,6 +173,12 @@ def get_args_parser():
 
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
+    parser.add_argument('--wandb', action='store_true',
+                        help='log metrics to public Weights & Biases')
+    parser.add_argument('--wandb-entity', default='LVSM-Experiment')
+    parser.add_argument('--wandb-project', default='videosft')
+    parser.add_argument('--wandb-run-name', default=None,
+                        help='required when --wandb is enabled')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
@@ -209,6 +215,7 @@ def main(args):
     utils.init_distributed_mode(args)
 
     print(args)
+    wandb_logger = utils.init_wandb(args)
 
     if args.distillation_type != 'none' and args.finetune and not args.eval:
         raise NotImplementedError("Finetuning with distillation not yet supported")
@@ -453,10 +460,17 @@ def main(args):
     if args.eval:
         test_stats = evaluate(data_loader_val, model, device, amp_autocast)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        wandb_stats = {f'test_{k}': v for k, v in test_stats.items()}
         if args.model_ema:
             utils._load_checkpoint_for_ema(model_ema, checkpoint['model_ema'])
             test_stats_ema = evaluate_ema(data_loader_val, model, device, amp_autocast, model_ema)
             print(f"EMA Accuracy of the network on the {len(dataset_val)} test images: {test_stats_ema['acc1']:.1f}%")
+            wandb_stats.update(
+                {f'test_ema_{k}': v for k, v in test_stats_ema.items()}
+            )
+        if wandb_logger is not None:
+            wandb_logger.log(wandb_stats, step=0)
+            wandb_logger.finish()
         return
 
     print(f"Start training for {args.epochs} epochs")
@@ -527,6 +541,9 @@ def main(args):
                      **{f'test_{k}': v for k, v in test_stats.items()},
                      'epoch': epoch,
                      'n_parameters': n_parameters}
+
+        if wandb_logger is not None:
+            wandb_logger.log(log_stats, step=epoch)
         
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
@@ -535,6 +552,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if wandb_logger is not None:
+        wandb_logger.finish()
 
 
 if __name__ == '__main__':

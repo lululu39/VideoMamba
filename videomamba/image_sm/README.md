@@ -27,6 +27,22 @@ python main.py --model videovit_tiny <your existing ImageNet arguments>
 VideoViT does not currently provide pretrained checkpoints; train from scratch
 or pass a compatible checkpoint with `--finetune`.
 
+To monitor image training in the public `LVSM-Experiment/videosft` W&B project,
+explicitly clear the machine's internal endpoint and provide the run name for
+the current experiment:
+
+```shell
+unset WANDB_BASE_URL
+python main.py \
+    --model videovit_tiny \
+    --wandb \
+    --wandb-run-name <run-name> \
+    <your existing ImageNet arguments>
+```
+
+Only distributed rank 0 creates a W&B run. The code never prints or clears the
+W&B API key.
+
 We currenent release the code and models for:
 
 - [x] **ImageNet-1K pretraining**

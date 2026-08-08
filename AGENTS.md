@@ -85,6 +85,24 @@
   `pretrained_cfg_overlay`、`cache_dir`。不要让模型构造函数静默吞掉任意
   `**kwargs`，否则参数拼写错误不会被发现。
 
+## Weights & Biases 规则
+
+- image VideoViT 训练、视频分类 SFT 和视频回归 SFT 均支持 W&B；只允许主 rank
+  初始化和上报，其他分布式 rank 不得创建重复 run。
+- 默认 W&B entity 是 `LVSM-Experiment`，默认 project 是 `videosft`，对应页面为
+  `https://wandb.ai/LVSM-Experiment/videosft`。除非用户在当次任务明确覆盖，否则
+  不要修改这两个默认值。
+- run name 不设自动默认值。每次启动实验时，必须根据用户对该次实验的最新指示
+  显式传入 `--wandb_run_name <name>`；image 入口使用等价参数
+  `--wandb-run-name <name>`。不要自行猜测、复用或覆盖 run name。
+- 本机环境可能把 `WANDB_BASE_URL` 指向内网。访问公网 W&B 时，启动命令必须在
+  同一个 shell 中先显式执行 `unset WANDB_BASE_URL`，再启动训练；代码初始化时也
+  会再次移除该变量并打印 `unset WANDB_BASE_URL` 作为保障。
+- 不要 unset `WANDB_API_KEY`，也不要在日志、命令输出、文档或提交中打印、记录
+  或泄露其值。
+- 标准启动形式为：先执行 `unset WANDB_BASE_URL`，再为训练命令加入 `--wandb`
+  和本次指定的 run-name 参数。W&B 包已记录在 `environment-videovit.yml`。
+
 ## 已执行的验证
 
 - VideoViT：timm registry 构造、CPU FP32 与 H100 BF16 前后向、gradient
@@ -104,5 +122,8 @@
   真实尺寸推理。
 - Image ViT 初始化：VideoViT 和 VideoLACT 都已验证 2D patch kernel 中心膨胀、
   window QKV 逐值加载、类别头跳过以及 LACT-only 参数保持新初始化。
+- W&B：已用 offline run 验证 image/video logger 生命周期、batch/epoch scalar
+  上报、CLI 默认 entity/project、run name 必填、`WANDB_BASE_URL` 清除后选择
+  `https://api.wandb.ai`，以及非主 rank 不初始化 run。
 - 通用：AdamW/NAdam 构造、layer decay、compileall、Conda YAML dry-run 和 Git
   whitespace 检查。

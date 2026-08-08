@@ -182,6 +182,12 @@ def get_args():
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default=None,
                         help='path where to tensorboard log')
+    parser.add_argument('--wandb', action='store_true',
+                        help='log metrics to public Weights & Biases')
+    parser.add_argument('--wandb_entity', default='LVSM-Experiment')
+    parser.add_argument('--wandb_project', default='videosft')
+    parser.add_argument('--wandb_run_name', default=None,
+                        help='required when --wandb is enabled')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
@@ -239,6 +245,8 @@ def get_args():
     args = parser.parse_args()
     if args.tubelet_size is None:
         args.tubelet_size = 1 if 'videolact' in args.model else 2
+    if args.wandb and not args.wandb_run_name:
+        parser.error('--wandb_run_name is required when --wandb is set')
     return args, ds_init
 
 
@@ -249,6 +257,7 @@ def main(args, ds_init):
         utils.create_ds_config(args)
 
     print(args)
+    wandb_logger = utils.init_wandb(args)
 
     device = torch.device(args.device)
 
@@ -286,11 +295,13 @@ def main(args, ds_init):
     else:
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
+    loggers = []
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
-    else:
-        log_writer = None
+        loggers.append(utils.TensorboardLogger(log_dir=args.log_dir))
+    if wandb_logger is not None:
+        loggers.append(wandb_logger)
+    log_writer = utils.CompositeLogger(loggers) if loggers else None
 
     if args.num_sample > 1:
         collate_func = partial(multiple_samples_collate, fold=False)
@@ -663,10 +674,14 @@ def main(args, ds_init):
             print(f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%")
             log_stats = {'Final top-1': final_top1,
                         'Final Top-5': final_top5}
+            if wandb_logger is not None:
+                wandb_logger.log(log_stats, step=0)
             if args.output_dir and utils.is_main_process():
                 with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                     f.write(json.dumps(log_stats) + "\n")
-        exit(0)
+        if wandb_logger is not None:
+            wandb_logger.finish()
+        return
         
 
     print(f"Start training for {args.epochs} epochs")
@@ -722,6 +737,8 @@ def main(args, ds_init):
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                          'epoch': epoch,
                          'n_parameters': n_parameters}
+        if wandb_logger is not None:
+            wandb_logger.log(log_stats, step=epoch)
         if args.output_dir and utils.is_main_process():
             if log_writer is not None:
                 log_writer.flush()
@@ -747,6 +764,8 @@ def main(args, ds_init):
         print(f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%")
         log_stats = {'Final top-1': final_top1,
                     'Final Top-5': final_top5}
+        if wandb_logger is not None:
+            wandb_logger.log(log_stats, step=args.epochs)
         if args.output_dir and utils.is_main_process():
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
@@ -754,6 +773,8 @@ def main(args, ds_init):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if wandb_logger is not None:
+        wandb_logger.finish()
 
 
 if __name__ == '__main__':
