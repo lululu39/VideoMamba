@@ -429,7 +429,9 @@ def main(args, ds_init):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.finetune, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.finetune, map_location='cpu')
+            checkpoint = torch.load(
+                args.finetune, map_location='cpu', weights_only=False
+            )
 
         print("Load ckpt from %s" % args.finetune)
         checkpoint_model = None
@@ -642,7 +644,9 @@ def main(args, ds_init):
 
     if args.eval:
         if args.resume:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(
+                args.resume, map_location='cpu', weights_only=False
+            )
             print("Load ckpt from %s" % args.resume)
             checkpoint_model = None
             for model_key in args.model_key.split('|'):

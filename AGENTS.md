@@ -87,6 +87,9 @@
 - 自定义 timm factory 只显式移除 `pretrained_cfg`、
   `pretrained_cfg_overlay`、`cache_dir`。不要让模型构造函数静默吞掉任意
   `**kwargs`，否则参数拼写错误不会被发现。
+- 当前 PyTorch 默认使用 `torch.load(weights_only=True)`；`video_sm` 的监督分类和
+  回归 finetune/resume checkpoint 包含 `argparse.Namespace` 与 optimizer 状态，
+  因此可信的本仓库 checkpoint 路径必须显式传入 `weights_only=False`。
 
 ## ImageNet-1K 数据规则
 
@@ -103,6 +106,20 @@
   `imagenet-1k/meta/train.txt`、validation root `imagenet-1k/val`、validation meta
   `imagenet-1k/meta/val.txt`。启动完整训练前要检查 1,281,167 个 train 样本、
   50,000 个 validation 样本，并用仓库 DataLoader 实际读取样本。
+
+## Kinetics-400 数据规则
+
+- K400 视频使用 Hugging Face `9tlofrjjlcq5/k400`，CSV 使用 VideoMamba 官方
+  `k400.zip` 中的数据列表；不要使用 HF 仓库里混合 K400/K700 的
+  `k710_train.csv`。原始视频归档保存在 `/mnt/localssd/dataset/videovit/k400-hf`。
+- 展开后 metadata root 为 `/mnt/localssd/dataset/videovit/k400/kinetics_400`，
+  video root 为其 `videos_320/`；训练对应传入前者作为 `--data_path`、后者作为
+  `--prefix`，并使用 `--data_set Kinetics_sparse --split ',' --nb_classes 400`。
+- 当前共有 240,436 个 train、19,787 个 validation；`test.csv` 与 `val.csv`
+  相同。所有 split 都覆盖 400 类且没有缺失视频；目录共有 260,232 个 MP4，其中
+  9 个未被 train/val split 使用。
+- 下载分片 SHA-256、ZIP CRC、官方 CSV 文件覆盖，以及仓库 Decord 4-worker
+  DataLoader 的 train/validation `4x3x16x224x224` batch 均已验证通过。
 
 ## 实验输出规则
 
@@ -121,6 +138,22 @@
 - `exp_distill/videomamba_middle` 是原作者给 VideoMamba-Middle/Base 提供的特征蒸馏
   recipe，不是 middle 模型的代码限制。除非用户明确要求，VideoViT 的标准图像预训练
   不得因为模型名是 middle 而自动切换到 distill 入口。
+- K400 VideoViT-Middle F8 监督训练的 run name 为
+  `video-vit-middle-k400-f8x224`，入口脚本为
+  `videomamba/video_sm/exp/k400/videovit_middle/run_f8x224.sh`，输出固定放在
+  `/mnt/localssd/experiments/videovit/<run-name>/ckpt`。使用 ImageNet run 的
+  `best_checkpoint.pth` 初始化，数据使用 `kinetics_400` metadata root 和
+  `videos_320/` prefix。
+- K400 F8 超参数对齐原始 `videomamba_middle/run_f8x224.sh`：50 epochs、每卡
+  batch 32、`num_sample=2`、tubelet size 1、base LR `2e-4`、warmup 5 epochs、
+  drop path 0.8、layer decay 0.75。原 recipe 的 16 卡 global batch 512 在本机
+  8 卡上通过 `update_freq=2` 保持不变；入口按 repeated sample 继续缩放，实际
+  peak LR 为 `8e-4`。
+- 简要运行方式：确保 8 张 GPU 空闲且当前 shell 已提供 `WANDB_API_KEY`，执行
+  `unset WANDB_BASE_URL` 后运行
+  `bash videomamba/video_sm/exp/k400/videovit_middle/run_f8x224.sh`。脚本会自行激活
+  `videovit` 环境；后台运行时把 stdout/stderr 写入对应 run 目录的 `train.log`，
+  并把 launcher PID 写入 `train.pid`。
 
 ## Weights & Biases 规则
 
@@ -169,5 +202,9 @@
   meta 行数分别为 1,281,167 和 50,000，两个 split 都覆盖 1000 类。转换脚本已验证
   shard 级恢复，仓库真实增强和 8-worker DataLoader 已分别读取 train/validation 的
   `64x3x224x224` batch。
+- K400 VideoViT-Middle F8：ImageNet best checkpoint 初始化加载了 78,136,704 个
+  trunk 参数，仅时间位置编码和 400 类 head 新初始化；真实 K400 repeated sample
+  解码为两份 `3x8x224x224` clip。单张 H100 上用实际每 microbatch 64 clips、
+  累积两次并执行 AdamW step 已通过，峰值显存为 61.54 GiB。
 - 通用：AdamW/NAdam 构造、layer decay、compileall、Conda YAML dry-run 和 Git
   whitespace 检查。
