@@ -154,6 +154,16 @@
   `bash videomamba/video_sm/exp/k400/videovit_middle/run_f8x224.sh`。脚本会自行激活
   `videovit` 环境；后台运行时把 stdout/stderr 写入对应 run 目录的 `train.log`，
   并把 launcher PID 写入 `train.pid`。
+- 首次 K400 F8 run 最终 12-view test 为 top-1 73.154%、top-5 91.257%，最佳
+  single-view validation top-1 为 71.433%。该 run 使用 `layer_decay=0.75`；在 32 层
+  模型上底层 peak LR 只有约 `6e-8`，checkpoint 中 layer 0 QKV 相对 ImageNet
+  初始化仅变化约 0.21%。
+- no-layer-decay 对照 run 为 `video-vit-middle-k400-f8x224-no-ld`，入口脚本是
+  `videomamba/video_sm/exp/k400/videovit_middle/run_f8x224_no_ld.sh`。它只把
+  `--layer_decay` 改为 `1.0` 并使用独立输出/W&B run name，其他训练和评估参数与
+  首次 F8 run 完全相同。`layer_decay=1.0` 会关闭 `LayerDecayValueAssigner`，所有层
+  使用相同的 scheduler LR。ImageNet 预训练入口不使用 `video_sm` 的这套 layer-wise
+  LR decay。
 
 ## Weights & Biases 规则
 
