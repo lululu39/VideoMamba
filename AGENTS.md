@@ -34,20 +34,20 @@
 - 此处 LACT 的 sequence mixer 是“每个 tubelet 的 window softmax attention +
   SwiGLU fast-weight memory”；两部分合起来才是 LACT，不能只保留其中之一。
   mixer 之后继续使用与 VideoViT 完全相同的 slow SwiGLU MLP。
-- 一个 attention window 恰好对应一个嵌入后的 tubelet，即
-  `1 CLS + N spatial patches`，`window_size == N + 1`。每个 tubelet 复用同一个
-  `cls_token` 和空间 `pos_embed`，并叠加对应的时间位置编码。fast-weight chunk
-  可以用 `fw_update_group_size` 合并多个连续 tubelet，因此
-  `chunk_size == window_size * fw_update_group_size`；该参数默认 1。
+- 每个嵌入后的 tubelet 含 `1 CLS + N spatial patches`。每个 tubelet 复用同一个
+  `cls_token` 和空间 `pos_embed`，并叠加对应的时间位置编码。attention window 与
+  fast-weight chunk 必须覆盖相同的一组连续 tubelet：
+  `window_size == chunk_size == (N + 1) * fw_update_group_size`；group size 默认 1。
 - `kernel_size/tubelet_size` 默认是 1，但允许设置为任意能整除 `num_frames` 的
   正整数。当其大于 1 时，一个 tubelet 内聚合的 token 共同完成一次
   apply-then-update，而不是逐原始帧更新。分类与回归 CLI 未显式传参时，
   `videolact_*` 默认用 1，其他已有模型仍默认用 2。
 - 调度依赖必须是 apply-then-update：当前 FW group 使用旧 fast weight，更新后的
   fast weight 只能供后续 group 使用。实现采用 layer-major 等价调度：每层先把
-  所有 tubelet 的独立 window attention 合并成一个 batched SDPA，再按时间顺序
-  串行执行该层的 grouped memory apply/update 与 slow MLP。各层 fast state 相互独立，因此
-  该调度与原 tubelet-major 依赖图等价。分类/回归读取最后一个 tubelet 的 CLS。
+  所有独立的 FW-group-sized attention window 合并成一个 batched SDPA，再按时间
+  顺序串行执行该层的 grouped memory apply/update 与 slow MLP。各层 fast state
+  相互独立，因此该调度与原 group-major 依赖图等价。分类/回归读取最后一个
+  tubelet 的 CLS。
 - 每层 window attention 使用 `norm` 和 `mixer.qkv/out_proj` 命名，以便直接
   加载 image VideoViT 权重。默认 `share_proj=False`，fast-weight 分支保留独立
   `apply_proj`、`update_proj`、`value_proj` 和 `output_proj`；`share_proj=True`
@@ -103,9 +103,9 @@
   4,096，共 8 个 chunk；实现跳过最后一个 chunk 的 memory update，因此每层每个
   sample 实际更新 7 次，`seqlen / chunk = 8`。
 - 当前 VideoLACT 在 `224/16` 下每个嵌入 tubelet 为 `1 + 14 * 14 = 197` tokens。
-  `fw_update_group_size` 已实现“多个嵌入 tubelet 合并一次 FW apply/update”，同时
-  保持逐 tubelet window attention：5/6/8 个 tubelet 分别对应 985/1182/1576
-  tokens，20/21 个对应 3940/4137 tokens。
+  `fw_update_group_size` 会把多个连续 tubelet 同时合并为一个 attention window 和
+  一次 FW apply/update chunk：4/5/6/8 个 tubelet 分别对应
+  788/985/1182/1576 tokens，20/21 个对应 3940/4137 tokens。
 - 若每个 FW group 都 update 且跳过最后一次无后继状态的 update，设视频有 `F`
   帧、temporal tubelet size 为 `k`、每个 FW group 含 `g` 个嵌入 tubelet，则
   `num_groups = ceil((F / k) / g)`，对最终预测有效的 update 数为
@@ -268,10 +268,11 @@
 - VideoViT：空间/时间位置编码插值后严格加载 checkpoint。
 - VideoLACT：CPU apply/update 前后向，window attention、fast weight、slow MLP、
   private/shared projection 与 `lr_proj` 均获得梯度；group size 1/2 的前后向以及
-  `chunk_size == window_size * fw_update_group_size` 已验证。
+  `chunk_size == window_size == tokens_per_tubelet * fw_update_group_size` 已验证。
 - VideoLACT：layer-major 调度与原 tubelet-major apply-then-update 实现已做输出和
-  梯度等价检查；每层所有 window attention 合并为一次 `(B*T, 197, D)` SDPA，
-  fast-weight apply/update 仍按 tubelet 时间顺序串行。
+  梯度等价检查；每层所有完整 grouped window 合并为一次
+  `(B*num_groups, group_size*197, D)` SDPA，fast-weight apply/update 仍按 group
+  时间顺序串行。非整除的最后一个短 group 使用独立形状的 SDPA。
 - VideoLACT：默认 private projection 路径及 shared projection 对照路径均已验证；
   shared 模式下 Q/K/V 分别进入 FW apply/update/target，memory output 复用
   attention out projection。
@@ -287,14 +288,21 @@
   Triton kernel；整层 recurrent-scan checkpoint 已在 CPU private/shared 模式以及
   H100 BF16 compiled private 模式验证，带 attention dropout/drop-path 时输出、输入
   梯度和所有参数梯度均与 eager 路径逐值一致（最大差值 0）。
-- F64 Middle H100 BF16 训练步对照（224、400 类、dropout/drop-path 0、FP32 参数与
-  梯度、无 optimizer、全层 checkpoint、编译预热不计）：VideoViT 对 12,545
-  tokens 做 full attention；默认 private-proj VideoLACT 使用 64 个 197-token
-  window、`fw_update_group_size=8`（每层 8 group/7 update）。正式 outer-scan
-  checkpoint 下，相同 B8 的 ViT/LACT 为 1315/2071 ms、6.08/3.86 samples/s、
-  8.32/14.16 GiB；相同 B16 为 2619/3146 ms、6.11/5.09 samples/s、
-  16.26/27.76 GiB。B16 下 LACT step time 多约 20%、吞吐低约 17%，峰值显存为
-  1.71 倍；旧逐 update checkpoint 的 B16 峰值为 56.34 GiB、约 3.46 倍。
+- K400 Middle H100 BF16 前后向对照（224、400 类、drop-path 0.8、FP32 参数与梯度、
+  无 optimizer/FSDP/dataloader、全层 checkpoint、编译预热不计）使用脚本的真实
+  单卡模型 batch：F32 脚本 `batch_size=8,num_sample=2`，collate 后 B16；F64 脚本
+  `batch_size=4,num_sample=2`，collate 后 B8。两者均为 8 个 FW group，F32 每组
+  4 帧/788-token attention window，F64 每组 8 帧/1576-token window；最后一个
+  无后继 state 的 update 仍跳过，因此实际写入 7 次。稳定复测结果：F32 的
+  ViT/LACT 为 839/2527 ms、19.07/6.33 clips/s、8.32/16.86 GiB，LACT 是
+  3.01 倍 step time、2.03 倍显存；F64 为 1315/2181 ms、6.08/3.67 clips/s、
+  8.32/14.16 GiB，LACT 是 1.66 倍 step time、1.70 倍显存。ViT 分别对
+  6,273/12,545 tokens 做 full attention。
+- 改成 grouped attention window 之前，F64 private-proj LACT 的 197-token
+  per-tubelet window 在 B8 为约 2071 ms/14.16 GiB；扩大为 1576-token window 后
+  为约 2181 ms/14.16 GiB，即显存基本不变、step time 增加约 5%。旧逐 update
+  checkpoint 的 F64 B16 峰值为 56.34 GiB；这是 checkpoint 粒度问题，不能与当前
+  grouped-window B8 结果直接比较。
 - F64 LACT B16 显存归因：depth 32 为 56.33 GiB，完全相同配置改成 depth 8 仅
   15.90 GiB；`residual_in_fp32` true/false 均为 15.90 GiB，当前峰值不是该开关
   导致。depth-32 baseline 在 forward 结束时已常驻 55.16 GiB，backward 只把峰值

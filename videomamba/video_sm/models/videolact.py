@@ -406,40 +406,96 @@ class LACTBlock(nn.Module):
         key = self.memory.apply_norm(F.silu(key))
         return query, key, value.contiguous()
 
-    def _apply_window_attention(self, x):
-        batch_size, tubelets, seq_len, dim = x.shape
-        x = x.reshape(batch_size * tubelets, seq_len, dim)
-        x = x + self.drop_path(
+    def _attend_flat_windows(self, x):
+        """Apply attention to a batch of already flattened token windows."""
+        return x + self.drop_path(
             self.mixer(self.norm(x.to(dtype=self.norm.weight.dtype)))
         )
-        return x.reshape(batch_size, tubelets, seq_len, dim)
+
+    def _apply_window_attention(self, x, window_group_size=1):
+        batch_size, tubelets, seq_len, dim = x.shape
+        if window_group_size <= 0:
+            raise ValueError(
+                "window_group_size must be positive, got "
+                f"{window_group_size}"
+            )
+
+        # A window covers exactly the same consecutive tubelets as one
+        # fast-weight apply/update group. All full windows are still evaluated
+        # in one batched SDPA call; only a possible short tail needs a second
+        # shape-specialized call.
+        full_window_count = tubelets // window_group_size
+        full_tubelet_count = full_window_count * window_group_size
+        outputs = []
+        if full_window_count:
+            full_windows = x[:, :full_tubelet_count].reshape(
+                batch_size * full_window_count,
+                window_group_size * seq_len,
+                dim,
+            )
+            full_windows = self._attend_flat_windows(full_windows)
+            outputs.append(
+                full_windows.reshape(
+                    batch_size,
+                    full_tubelet_count,
+                    seq_len,
+                    dim,
+                )
+            )
+        if full_tubelet_count < tubelets:
+            tail_tubelets = tubelets - full_tubelet_count
+            tail_window = x[:, full_tubelet_count:].reshape(
+                batch_size,
+                tail_tubelets * seq_len,
+                dim,
+            )
+            tail_window = self._attend_flat_windows(tail_window)
+            outputs.append(
+                tail_window.reshape(
+                    batch_size,
+                    tail_tubelets,
+                    seq_len,
+                    dim,
+                )
+            )
+        return torch.cat(outputs, dim=1)
 
     @torch.compile
-    def _compiled_window_attention(self, x):
-        return self._apply_window_attention(x)
+    def _compiled_window_attention(self, x, window_group_size):
+        return self._apply_window_attention(x, window_group_size)
 
     @torch.compile
-    def _compiled_checkpoint_window_attention(self, x):
+    def _compiled_checkpoint_window_attention(self, x, window_group_size):
         return checkpoint.checkpoint(
             self._apply_window_attention,
             x,
+            window_group_size,
             preserve_rng_state=True,
             use_reentrant=False,
         )
 
-    def apply_window_attention(self, x, use_checkpoint=False):
+    def apply_window_attention(
+        self,
+        x,
+        window_group_size=1,
+        use_checkpoint=False,
+    ):
         if use_checkpoint:
             if x.is_cuda:
-                return self._compiled_checkpoint_window_attention(x)
+                return self._compiled_checkpoint_window_attention(
+                    x,
+                    window_group_size,
+                )
             return checkpoint.checkpoint(
                 self._apply_window_attention,
                 x,
+                window_group_size,
                 preserve_rng_state=True,
                 use_reentrant=False,
             )
         if x.is_cuda:
-            return self._compiled_window_attention(x)
-        return self._apply_window_attention(x)
+            return self._compiled_window_attention(x, window_group_size)
+        return self._apply_window_attention(x, window_group_size)
 
     def _apply_memory_mlp_chunk(self, x, w0, w1, w2):
         if x.ndim not in (3, 4):
@@ -610,7 +666,11 @@ class LACTBlock(nn.Module):
     def _forward_scan(self, x, fw_update_group_size):
         """Run one complete layer, including its recurrent fast-weight scan."""
         batch_size, tubelets, _, _ = x.shape
-        x = self.apply_window_attention(x, use_checkpoint=False)
+        x = self.apply_window_attention(
+            x,
+            window_group_size=fw_update_group_size,
+            use_checkpoint=False,
+        )
 
         fast_weights, master_weights = self.init_fast_weights(batch_size)
         group_outputs = []
@@ -787,9 +847,9 @@ class VisionLACT(nn.Module):
         )
         temporal_tokens = num_frames // kernel_size
         self.tokens_per_tubelet = self.patch_embed.num_patches + 1
-        self.window_size = self.tokens_per_tubelet
         self.fw_update_group_size = int(fw_update_group_size)
         self.chunk_size = self.tokens_per_tubelet * self.fw_update_group_size
+        self.window_size = self.chunk_size
         self.cls_token = nn.Parameter(
             torch.zeros(1, 1, embed_dim, **factory_kwargs)
         )
@@ -880,10 +940,11 @@ class VisionLACT(nn.Module):
         x = self.pos_drop(x)
 
         # Process layers outermost so every layer can evaluate all independent
-        # tubelet attention windows in one batched SDPA call. Fast weights are
-        # still applied and updated recurrently, in temporal group order, within
-        # each layer. Since fast-weight state is private to a layer, this is the
-        # same dependency graph as the corresponding group-major schedule.
+        # FW-group-sized attention windows in one batched SDPA call. Fast
+        # weights are still applied and updated recurrently, in temporal group
+        # order, within each layer. Since fast-weight state is private to a
+        # layer, this is the same dependency graph as the corresponding
+        # group-major schedule.
         for layer_index, layer in enumerate(self.layers):
             use_checkpoint = (
                 self.use_checkpoint and layer_index < self.checkpoint_num
