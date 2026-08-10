@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from timm.layers import DropPath, to_2tuple, trunc_normal_
+from timm.layers import to_2tuple, trunc_normal_
 from timm.models import register_model
 from timm.models.vision_transformer import _cfg, _load_weights
 
@@ -93,14 +93,41 @@ class SwiGLUMLP(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
+class TensorDropPath(nn.Module):
+    """Stochastic depth with a tensor probability shared by compiled graphs."""
+
+    _PROBABILITY_SCALE = 1 << 24
+
+    def __init__(self, drop_prob):
+        super().__init__()
+        self.register_buffer(
+            "drop_prob_scaled",
+            torch.tensor(
+                round(float(drop_prob) * self._PROBABILITY_SCALE),
+                dtype=torch.int32,
+            ),
+            persistent=False,
+        )
+
+    def forward(self, x):
+        if not self.training:
+            return x
+        drop_prob = self.drop_prob_scaled.float() / self._PROBABILITY_SCALE
+        keep_prob = 1.0 - drop_prob
+        mask_shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = x.new_empty(mask_shape).bernoulli_(keep_prob)
+        return x * random_tensor.div_(keep_prob)
+
+
 class FastWeightSwiGLU(nn.Module):
-    """Multi-head SwiGLU fast weights with independent apply/update projections."""
+    """Multi-head SwiGLU fast weights with optional private projections."""
 
     def __init__(
         self,
         dim,
         inter_multi=2,
         num_heads=1,
+        share_proj=False,
         norm_epsilon=1e-5,
         device=None,
         dtype=None,
@@ -115,20 +142,32 @@ class FastWeightSwiGLU(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.hidden_dim = int(dim * inter_multi)
+        self.share_proj = share_proj
 
-        self.apply_proj = nn.Sequential(
-            nn.Linear(dim, dim, bias=False, **factory_kwargs),
-            nn.SiLU(),
-        )
+        if share_proj:
+            self.apply_proj = None
+            self.update_proj = None
+            self.output_proj = None
+        else:
+            self.apply_proj = nn.Sequential(
+                nn.Linear(dim, dim, bias=False, **factory_kwargs),
+                nn.SiLU(),
+            )
+            self.update_proj = nn.Sequential(
+                nn.Linear(dim, dim, bias=False, **factory_kwargs),
+                nn.SiLU(),
+            )
+            self.output_proj = nn.Linear(
+                dim,
+                dim,
+                bias=False,
+                **factory_kwargs,
+            )
         self.apply_norm = nn.RMSNorm(
             dim,
             eps=norm_epsilon,
             elementwise_affine=False,
             **factory_kwargs,
-        )
-        self.update_proj = nn.Sequential(
-            nn.Linear(dim, dim, bias=False, **factory_kwargs),
-            nn.SiLU(),
         )
         self.output_norm = nn.RMSNorm(
             dim,
@@ -136,7 +175,6 @@ class FastWeightSwiGLU(nn.Module):
             elementwise_affine=False,
             **factory_kwargs,
         )
-        self.output_proj = nn.Linear(dim, dim, bias=False, **factory_kwargs)
 
         parameter_kwargs = {
             key: value for key, value in factory_kwargs.items() if value is not None
@@ -202,9 +240,13 @@ class FastWeightSwiGLU(nn.Module):
         return output, x_heads, gate, up, hidden
 
     def forward(self, x, fast_weights):
-        x = self.apply_norm(self.apply_proj(x))
+        if self.apply_proj is not None:
+            x = self.apply_norm(self.apply_proj(x))
         output, _, _, _, _ = self._apply_fast_weights(x, fast_weights)
-        return self.output_proj(self.output_norm(output))
+        output = self.output_norm(output)
+        if self.output_proj is not None:
+            output = self.output_proj(output)
+        return output
 
     def update(
         self,
@@ -219,7 +261,9 @@ class FastWeightSwiGLU(nn.Module):
         master_w0, master_w1, master_w2 = master_weights
         batch_size, seq_len, _ = memory_input.shape
 
-        key = self.apply_norm(self.update_proj(memory_input))
+        key = memory_input
+        if self.update_proj is not None:
+            key = self.apply_norm(self.update_proj(key))
         output, key_heads, gate, up, hidden = self._apply_fast_weights(
             key,
             fast_weights,
@@ -302,6 +346,7 @@ class LACTBlock(nn.Module):
         fw_num_heads=1,
         fw_base_lr=0.01,
         muon_update_steps=5,
+        share_proj=False,
         norm_epsilon=1e-5,
         device=None,
         dtype=None,
@@ -315,6 +360,7 @@ class LACTBlock(nn.Module):
             )
         factory_kwargs = {"device": device, "dtype": dtype}
         self.residual_in_fp32 = residual_in_fp32
+        self.share_proj = share_proj
 
         # Keep these names aligned with image VideoViT checkpoints.
         self.norm = norm_cls(dim, **factory_kwargs)
@@ -326,17 +372,24 @@ class LACTBlock(nn.Module):
             proj_drop=proj_drop,
             **factory_kwargs,
         )
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        self.drop_path = (
+            TensorDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        )
 
         self.memory_norm = norm_cls(dim, **factory_kwargs)
         self.memory = FastWeightSwiGLU(
             dim,
             inter_multi=fw_inter_multi,
             num_heads=fw_num_heads,
+            share_proj=share_proj,
             norm_epsilon=norm_epsilon,
             **factory_kwargs,
         )
-        self.value_proj = nn.Linear(dim, dim, bias=False, **factory_kwargs)
+        self.value_proj = (
+            None
+            if share_proj
+            else nn.Linear(dim, dim, bias=False, **factory_kwargs)
+        )
         self.lr_proj = nn.Linear(dim, 3, bias=False, **factory_kwargs)
         self.base_lr_inverse = inverse_softplus(fw_base_lr)
         self.muon_update_steps = muon_update_steps
@@ -347,22 +400,124 @@ class LACTBlock(nn.Module):
     def init_fast_weights(self, batch_size):
         return self.memory.init_fast_weights(batch_size)
 
-    def _apply_chunk(self, x, w0, w1, w2):
+    def _shared_qkv(self, memory_input):
+        query, key, value = self.mixer.qkv(memory_input).chunk(3, dim=-1)
+        query = self.memory.apply_norm(F.silu(query))
+        key = self.memory.apply_norm(F.silu(key))
+        return query, key, value.contiguous()
+
+    def _apply_window_attention(self, x):
+        batch_size, tubelets, seq_len, dim = x.shape
+        x = x.reshape(batch_size * tubelets, seq_len, dim)
         x = x + self.drop_path(
             self.mixer(self.norm(x.to(dtype=self.norm.weight.dtype)))
         )
+        return x.reshape(batch_size, tubelets, seq_len, dim)
+
+    @torch.compile
+    def _compiled_window_attention(self, x):
+        return self._apply_window_attention(x)
+
+    @torch.compile
+    def _compiled_checkpoint_window_attention(self, x):
+        return checkpoint.checkpoint(
+            self._apply_window_attention,
+            x,
+            preserve_rng_state=True,
+            use_reentrant=False,
+        )
+
+    def apply_window_attention(self, x, use_checkpoint=False):
+        if use_checkpoint:
+            if x.is_cuda:
+                return self._compiled_checkpoint_window_attention(x)
+            return checkpoint.checkpoint(
+                self._apply_window_attention,
+                x,
+                preserve_rng_state=True,
+                use_reentrant=False,
+            )
+        if x.is_cuda:
+            return self._compiled_window_attention(x)
+        return self._apply_window_attention(x)
+
+    def _apply_memory_mlp_chunk(self, x, w0, w1, w2):
+        if x.ndim not in (3, 4):
+            raise ValueError(
+                "Expected memory input shaped [B, L, D] or [B, G, L, D], "
+                f"got {tuple(x.shape)}"
+            )
+        grouped = x.ndim == 4
+        if not grouped:
+            x = x.unsqueeze(1)
+        batch_size, group_size, seq_len, dim = x.shape
+        flat_x = x.reshape(batch_size, group_size * seq_len, dim)
         memory_input = self.memory_norm(
-            x.to(dtype=self.memory_norm.weight.dtype)
+            flat_x.to(dtype=self.memory_norm.weight.dtype)
         )
-        x = x + self.drop_path(
-            self.memory(memory_input, (w0, w1, w2))
+        if self.share_proj:
+            query, key, target = self._shared_qkv(memory_input)
+            memory_output = self.memory(query, (w0, w1, w2))
+            memory_output = self.mixer.proj_drop(
+                self.mixer.out_proj(memory_output)
+            )
+        else:
+            key = target = memory_input
+            memory_output = self.memory(memory_input, (w0, w1, w2))
+        memory_output = memory_output.reshape(
+            batch_size * group_size,
+            seq_len,
+            dim,
         )
-        x = x + self.drop_path(
-            self.mlp(self.norm_mlp(x.to(dtype=self.norm_mlp.weight.dtype)))
+        x = x + self.drop_path(memory_output).reshape_as(x)
+        flat_group_x = x.reshape(batch_size * group_size, seq_len, dim)
+        slow_output = self.mlp(
+            self.norm_mlp(
+                flat_group_x.to(dtype=self.norm_mlp.weight.dtype)
+            )
         )
+        x = x + self.drop_path(slow_output).reshape_as(x)
         if self.residual_in_fp32:
             x = x.float()
-        return x, memory_input
+        if not grouped:
+            x = x.squeeze(1)
+        return x, memory_input, key, target
+
+    @torch.compile
+    def _compiled_memory_mlp_chunk(self, x, *fast_weights):
+        return self._apply_memory_mlp_chunk(x, *fast_weights)
+
+    @torch.compile
+    def _compiled_checkpoint_memory_mlp_chunk(self, x, *fast_weights):
+        return checkpoint.checkpoint(
+            self._apply_memory_mlp_chunk,
+            x,
+            *fast_weights,
+            preserve_rng_state=True,
+            use_reentrant=False,
+        )
+
+    def apply_memory_mlp_chunk(self, x, fast_weights, use_checkpoint=False):
+        if use_checkpoint:
+            if x.is_cuda:
+                return self._compiled_checkpoint_memory_mlp_chunk(
+                    x,
+                    *fast_weights,
+                )
+            return checkpoint.checkpoint(
+                self._apply_memory_mlp_chunk,
+                x,
+                *fast_weights,
+                preserve_rng_state=True,
+                use_reentrant=False,
+            )
+        if x.is_cuda:
+            return self._compiled_memory_mlp_chunk(x, *fast_weights)
+        return self._apply_memory_mlp_chunk(x, *fast_weights)
+
+    def _apply_chunk(self, x, w0, w1, w2):
+        x = self._apply_window_attention(x.unsqueeze(1)).squeeze(1)
+        return self._apply_memory_mlp_chunk(x, w0, w1, w2)
 
     def apply_chunk(self, x, fast_weights, use_checkpoint=False):
         if use_checkpoint:
@@ -377,6 +532,8 @@ class LACTBlock(nn.Module):
     def _update_fast_weights(
         self,
         memory_input,
+        key,
+        target,
         w0,
         w1,
         w2,
@@ -389,7 +546,10 @@ class LACTBlock(nn.Module):
             normalized_shape=(memory_input.shape[-1],),
             eps=1e-5,
         )
-        target = self.value_proj(prediction_input)
+        update_input = key
+        if not self.share_proj:
+            update_input = memory_input
+            target = self.value_proj(prediction_input)
         with torch.autocast(device_type=memory_input.device.type, enabled=False):
             learning_rates = F.softplus(
                 F.linear(
@@ -399,7 +559,7 @@ class LACTBlock(nn.Module):
                 + self.base_lr_inverse
             )
         fast_weights, master_weights = self.memory.update(
-            memory_input,
+            update_input,
             target,
             learning_rates,
             (w0, w1, w2),
@@ -408,23 +568,91 @@ class LACTBlock(nn.Module):
         )
         return (*fast_weights, *master_weights)
 
+    @torch.compile
+    def _compiled_update_fast_weights(self, *args):
+        return self._update_fast_weights(*args)
+
+    @torch.compile
+    def _compiled_checkpoint_update_fast_weights(self, *args):
+        return checkpoint.checkpoint(
+            self._update_fast_weights,
+            *args,
+            preserve_rng_state=False,
+            use_reentrant=False,
+        )
+
     def update_fast_weights(
         self,
         memory_input,
+        key,
+        target,
         fast_weights,
         master_weights,
         use_checkpoint=False,
     ):
-        args = (memory_input, *fast_weights, *master_weights)
+        args = (memory_input, key, target, *fast_weights, *master_weights)
         if use_checkpoint:
-            outputs = checkpoint.checkpoint(
-                self._update_fast_weights,
-                *args,
-                use_reentrant=False,
-            )
+            if memory_input.is_cuda:
+                outputs = self._compiled_checkpoint_update_fast_weights(*args)
+            else:
+                outputs = checkpoint.checkpoint(
+                    self._update_fast_weights,
+                    *args,
+                    preserve_rng_state=False,
+                    use_reentrant=False,
+                )
+        elif memory_input.is_cuda:
+            outputs = self._compiled_update_fast_weights(*args)
         else:
             outputs = self._update_fast_weights(*args)
         return outputs[:3], outputs[3:]
+
+    def _forward_scan(self, x, fw_update_group_size):
+        """Run one complete layer, including its recurrent fast-weight scan."""
+        batch_size, tubelets, _, _ = x.shape
+        x = self.apply_window_attention(x, use_checkpoint=False)
+
+        fast_weights, master_weights = self.init_fast_weights(batch_size)
+        group_outputs = []
+        for group_start in range(0, tubelets, fw_update_group_size):
+            group_end = min(group_start + fw_update_group_size, tubelets)
+            chunk_output, memory_input, key, target = (
+                self.apply_memory_mlp_chunk(
+                    x[:, group_start:group_end],
+                    fast_weights,
+                    use_checkpoint=False,
+                )
+            )
+            # The final update has no later token to consume it, so skipping
+            # it preserves the output while avoiding dead computation.
+            if group_end < tubelets:
+                fast_weights, master_weights = self.update_fast_weights(
+                    memory_input,
+                    key,
+                    target,
+                    fast_weights,
+                    master_weights,
+                    use_checkpoint=False,
+                )
+            group_outputs.append(chunk_output)
+        return torch.cat(group_outputs, dim=1)
+
+    def forward_scan(self, x, fw_update_group_size, use_checkpoint=False):
+        if not use_checkpoint:
+            return self._forward_scan(x, fw_update_group_size)
+
+        # Checkpoint the complete recurrent scan, rather than each individual
+        # apply/update. The latter still has to retain every updated state for
+        # the next group and therefore does not reduce recurrent-state memory.
+        def checkpointed_scan(layer_input):
+            return self._forward_scan(layer_input, fw_update_group_size)
+
+        return checkpoint.checkpoint(
+            checkpointed_scan,
+            x,
+            preserve_rng_state=True,
+            use_reentrant=False,
+        )
 
 
 def _init_weights(
@@ -523,6 +751,8 @@ class VisionLACT(nn.Module):
         fw_num_heads=1,
         fw_base_lr=0.01,
         muon_update_steps=5,
+        share_proj=False,
+        fw_update_group_size=1,
         device=None,
         dtype=None,
         use_checkpoint=False,
@@ -536,6 +766,11 @@ class VisionLACT(nn.Module):
         if not 0 <= checkpoint_num <= depth:
             raise ValueError(
                 f"checkpoint_num={checkpoint_num} must be between 0 and depth={depth}"
+            )
+        if fw_update_group_size <= 0:
+            raise ValueError(
+                "fw_update_group_size must be positive, got "
+                f"{fw_update_group_size}"
             )
         factory_kwargs = {"device": device, "dtype": dtype}
         self.use_checkpoint = use_checkpoint
@@ -553,7 +788,8 @@ class VisionLACT(nn.Module):
         temporal_tokens = num_frames // kernel_size
         self.tokens_per_tubelet = self.patch_embed.num_patches + 1
         self.window_size = self.tokens_per_tubelet
-        self.chunk_size = self.tokens_per_tubelet
+        self.fw_update_group_size = int(fw_update_group_size)
+        self.chunk_size = self.tokens_per_tubelet * self.fw_update_group_size
         self.cls_token = nn.Parameter(
             torch.zeros(1, 1, embed_dim, **factory_kwargs)
         )
@@ -593,6 +829,7 @@ class VisionLACT(nn.Module):
                     fw_num_heads=fw_num_heads,
                     fw_base_lr=fw_base_lr,
                     muon_update_steps=muon_update_steps,
+                    share_proj=share_proj,
                     norm_epsilon=norm_epsilon,
                     **factory_kwargs,
                 )
@@ -642,44 +879,25 @@ class VisionLACT(nn.Module):
         x = x + self.temporal_pos_embedding.unsqueeze(2)
         x = self.pos_drop(x)
 
-        caches = []
-        for layer in self.layers:
-            fast_weights, master_weights = layer.init_fast_weights(batch_size)
-            caches.append([fast_weights, master_weights])
+        # Process layers outermost so every layer can evaluate all independent
+        # tubelet attention windows in one batched SDPA call. Fast weights are
+        # still applied and updated recurrently, in temporal group order, within
+        # each layer. Since fast-weight state is private to a layer, this is the
+        # same dependency graph as the corresponding group-major schedule.
+        for layer_index, layer in enumerate(self.layers):
+            use_checkpoint = (
+                self.use_checkpoint and layer_index < self.checkpoint_num
+            )
+            x = layer.forward_scan(
+                x,
+                self.fw_update_group_size,
+                use_checkpoint=use_checkpoint,
+            )
 
-        chunk_output = None
-        for tubelet_index in range(tubelets):
-            chunk_output = x[:, tubelet_index]
-            memory_inputs = []
-            for layer_index, (layer, cache) in enumerate(zip(self.layers, caches)):
-                use_checkpoint = (
-                    self.use_checkpoint and layer_index < self.checkpoint_num
-                )
-                chunk_output, memory_input = layer.apply_chunk(
-                    chunk_output,
-                    cache[0],
-                    use_checkpoint=use_checkpoint,
-                )
-                memory_inputs.append(memory_input)
-
-            # Apply the whole tubelet first, then update every layer.
-            for layer_index, (layer, cache, memory_input) in enumerate(
-                zip(self.layers, caches, memory_inputs)
-            ):
-                use_checkpoint = (
-                    self.use_checkpoint and layer_index < self.checkpoint_num
-                )
-                cache[0], cache[1] = layer.update_fast_weights(
-                    memory_input,
-                    cache[0],
-                    cache[1],
-                    use_checkpoint=use_checkpoint,
-                )
-
-        chunk_output = self.norm_f(
-            chunk_output.to(dtype=self.norm_f.weight.dtype)
+        x = self.norm_f(
+            x.to(dtype=self.norm_f.weight.dtype)
         )
-        return chunk_output[:, 0]
+        return x[:, -1, 0]
 
     def forward(self, x):
         return self.head(self.head_drop(self.forward_features(x)))

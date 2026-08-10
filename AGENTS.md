@@ -34,28 +34,104 @@
 - 此处 LACT 的 sequence mixer 是“每个 tubelet 的 window softmax attention +
   SwiGLU fast-weight memory”；两部分合起来才是 LACT，不能只保留其中之一。
   mixer 之后继续使用与 VideoViT 完全相同的 slow SwiGLU MLP。
-- 一个 window/chunk 恰好对应一个嵌入后的 tubelet token，即
-  `1 CLS + N spatial patches`，`window_size == chunk_size == N + 1`。每个
-  tubelet 复用同一个 `cls_token` 和空间 `pos_embed`，并叠加对应的时间位置编码。
+- 一个 attention window 恰好对应一个嵌入后的 tubelet，即
+  `1 CLS + N spatial patches`，`window_size == N + 1`。每个 tubelet 复用同一个
+  `cls_token` 和空间 `pos_embed`，并叠加对应的时间位置编码。fast-weight chunk
+  可以用 `fw_update_group_size` 合并多个连续 tubelet，因此
+  `chunk_size == window_size * fw_update_group_size`；该参数默认 1。
 - `kernel_size/tubelet_size` 默认是 1，但允许设置为任意能整除 `num_frames` 的
   正整数。当其大于 1 时，一个 tubelet 内聚合的 token 共同完成一次
   apply-then-update，而不是逐原始帧更新。分类与回归 CLI 未显式传参时，
   `videolact_*` 默认用 1，其他已有模型仍默认用 2。
-- 调度顺序必须是 apply-then-update：当前 tubelet 先依次通过所有 LACT block，
-  缓存每层 memory input；整个 tubelet apply 完成后，再更新所有层的 fast
-  weight；下一个 tubelet 才能使用更新后的权重。分类/回归读取最后一个
-  tubelet 的 CLS。
+- 调度依赖必须是 apply-then-update：当前 FW group 使用旧 fast weight，更新后的
+  fast weight 只能供后续 group 使用。实现采用 layer-major 等价调度：每层先把
+  所有 tubelet 的独立 window attention 合并成一个 batched SDPA，再按时间顺序
+  串行执行该层的 grouped memory apply/update 与 slow MLP。各层 fast state 相互独立，因此
+  该调度与原 tubelet-major 依赖图等价。分类/回归读取最后一个 tubelet 的 CLS。
 - 每层 window attention 使用 `norm` 和 `mixer.qkv/out_proj` 命名，以便直接
-  加载 image VideoViT 权重。fast-weight 分支必须使用独立的 `apply_proj`、
-  `update_proj`、`value_proj`、`lr_proj` 和 `output_proj`，严禁与 window
-  attention 共享 projection。
+  加载 image VideoViT 权重。默认 `share_proj=False`，fast-weight 分支保留独立
+  `apply_proj`、`update_proj`、`value_proj` 和 `output_proj`；`share_proj=True`
+  作为参数缩减对照，分别复用 attention Q/K/V 与 `mixer.out_proj`。
 - fast weight 是多头 SwiGLU FFN 的 `w0/w1/w2`。默认 `fw_inter_multi=2`、
   `fw_num_heads=1`、`fw_base_lr=0.01`。
-- 每个 tubelet 更新分别计算 `w0/w1/w2` 梯度，默认对每组梯度执行 5 次 Muon quintic
+- 每个 FW group 更新分别计算 `w0/w1/w2` 梯度，默认对每组梯度执行 5 次 Muon quintic
   Newton-Schulz zeroth-power 迭代，然后加到 FP32 master weight；新 fast
   weight 沿参考实现的维度归一化，并在 CUDA 上转为 BF16。
 - VideoLACT 的 `norm_mlp` 和 `mlp.gate/up/down` 必须与 VideoViT 保持相同参数名、
   形状和执行位置，使 image VideoViT 的 slow MLP 权重可以直接初始化两个视频模型。
+- CUDA 默认在 block 级对 window attention、memory/slow-MLP apply 和 fast-weight
+  update 使用 `torch.compile` 并复用 Inductor/Triton kernel。完整模型启用
+  activation checkpoint 时，边界必须覆盖每层完整 recurrent scan，内部调用上述
+  compiled 非 checkpoint kernel；不能只 checkpoint 单次 apply/update，否则下一
+  group 仍要消费 update 输出，所有 fast/master state 历史都无法释放。整层 scan
+  checkpoint 必须保留 attention dropout/drop-path RNG state；底层单算子 checkpoint
+  API 继续保留用于独立调用和测试。
+- stochastic depth 使用非持久化整数 tensor probability，在 kernel 内恢复 FP32，
+  避免不同层的 Python `drop_prob` 导致 Dynamo 重编译，也避免 `model.to(bfloat16)`
+  量化概率。共享 QKV 的 value 必须 contiguous，避免各层 stride guard 重编译。
+
+## LACT 参考实现与 chunk/update 结论
+
+- LVSM block 是严格 sequential residual：window attention -> fast-weight memory ->
+  slow MLP；attention 与 memory 不复用 QKV，memory update 另有 `to_v/to_lr`。
+  LLM recurrent LACT v4 同时支持 parallel 和 sequential residual；所检查的 124M
+  配置使用 parallel、`memory_kv_mode=reuse_kv`，apply/update 复用 attention Q/K/V，
+  attention 与 memory 相加后共用一个 output projection。当前 VideoLACT 保留
+  sequential residual 顺序，但默认使用独立 projection。
+- LVSM 参考配置为 `256/8=32`，每个 view 有 1024 tokens；训练 sample 有 12 views，
+  nanoauto 实际构造 `2 * (12 - 1)=22` 个 image-token block，总 sequence length 为
+  22,528。`parallel_ttt_config` 交替执行 1024-token update block 和 1024-token
+  apply-only block，因此 `seqlen / update_chunk = 22`，每层每个 sample 实际更新
+  11 次，平均每 2048 tokens 更新一次。
+- LVSM 的 transformer 对照不是一次 full-sequence attention 的标准 ViT，而是
+  recurrent KV-cache transformer：同样串行处理上述 22 个 1024-token op，每个
+  op 都逐层调用 attention；11 个 update op 才把新 K/V 写入持久 cache。配置也不是
+  同 batch：transformer 每卡 16，LACT 每卡 8。因此相近 step time 不代表相近
+  sample throughput。直接调用两个 depth-8 block stack、B1/22,528-token BF16
+  前后向时，transformer 为约 423 ms/1.51 GiB，LACT 为 563 ms/1.87 GiB；按配置
+  batch 16/8 测得约 938/725 ms，对应 17.1/11.0 samples/s。transformer 环境缺少
+  `flash_attn` 包时用等价 PyTorch SDPA H100 flash backend 完成此对照。
+- 加入 `transformer_vgap8_ablation5.yaml` 后，使用三个配置各自 batch 对完整
+  `Images2latent3D` 做合成 12-view 256² BF16 前后向（含 tokenizer/decoder/loss，
+  不含 optimizer step、FSDP 和 dataloader）：vgap-null Transformer B16 为
+  940.6 ms/22.84 GiB/17.01 samples/s；vgap8 per-layer-KV Transformer B16 为
+  942.1 ms/20.44 GiB/16.98 samples/s；LACT reference B8 为
+  728.7 ms/14.59 GiB/10.98 samples/s。按配置看 LACT 每步总峰值显存反而低
+  36%/29%，但折算每 sample 为 1.82 GiB，分别比两个 Transformer 的
+  1.43/1.28 GiB 高约 28%/43%；较小 batch 掩盖了单样本内存和吞吐成本。
+- LLM recurrent LACT v4 的训练 sequence length 为 32,768，window/chunk 都是
+  4,096，共 8 个 chunk；实现跳过最后一个 chunk 的 memory update，因此每层每个
+  sample 实际更新 7 次，`seqlen / chunk = 8`。
+- 当前 VideoLACT 在 `224/16` 下每个嵌入 tubelet 为 `1 + 14 * 14 = 197` tokens。
+  `fw_update_group_size` 已实现“多个嵌入 tubelet 合并一次 FW apply/update”，同时
+  保持逐 tubelet window attention：5/6/8 个 tubelet 分别对应 985/1182/1576
+  tokens，20/21 个对应 3940/4137 tokens。
+- 若每个 FW group 都 update 且跳过最后一次无后继状态的 update，设视频有 `F`
+  帧、temporal tubelet size 为 `k`、每个 FW group 含 `g` 个嵌入 tubelet，则
+  `num_groups = ceil((F / k) / g)`，对最终预测有效的 update 数为
+  `num_groups - 1`。建议首轮采用 48 帧、`k=1`、`g=6`：约 1182 tokens/chunk、
+  8 groups、7 次有效 update，update 次数与 LLM 一致且 chunk 大小接近 LVSM。
+  若希望接近 LVSM 的 11 次 update，可用 60 帧/`g=5` 或 72 帧/`g=6`。若同时
+  追求 LLM 式约 4K chunk 和 7 次 update，则需要约 160 帧/`g=20` 或
+  168 帧/`g=21`，成本过高，不建议作为首轮实验。
+- 实现会跳过最后一个 FW group 的无效 update，因为产生的 state 没有后续 token
+  消费。64 帧、`tubelet_size=1`、`fw_update_group_size=8` 时，每层有 8 个
+  1576-token group，实际 update 7 次。
+- fast-weight 参数大头来自 `w0/w1/w2`。当前 Middle 为 `dim=432`、depth 32、
+  1 FW head、`fw_inter_multi=2`：每层 1,119,744、全模型 35,831,808 个 FW 参数。
+  LVSM 为 `dim=512`、depth 8、1 head、inter 2：每层 1,572,864、总计
+  12,582,912。LLM 124M 为 `dim=768`、depth 12、4 heads、per-head inter 1：
+  runtime FW 每层 442,368、总计 5,308,416；w0/w2 使用 rank-32 low-rank 参数化。
+- 若保持 `dim=432`、默认 private projection 与其他 block 配置不变，VideoLACT
+  depth 18 在 64 帧/400 类下为 77,959,120 参数，与 depth-32 VideoViT 的
+  78,337,552 参数只差 -0.48%，可作为参数匹配补充对照。若沿 LVSM protocol 使用
+  同深度主对照，必须同时报告参数量、显存和吞吐，不能称为 parameter-matched。
+- 同为 `dim=512`、1 FW head、inter 2、sequence `16 * 1024`、chunk 1024、
+  5-step Muon 的单层 H100 BF16 对照中，本仓库 shared-proj eager 为 163.12 ms，
+  compiled 为 62.72 ms，compiled+checkpoint 为 71.42 ms；LVSM compiled+checkpoint
+  为 78.81 ms。实现本身与 LVSM 同量级；未分组的 197-token update 会过于频繁，
+  而分组后 B1 latency 仍会因小矩阵 GPU 利用率过低而夸大，训练吞吐应在能占满 GPU
+  的 batch 下比较。
 
 ## Image ViT 初始化视频模型
 
@@ -66,7 +142,8 @@
   如果 checkpoint 中存在时间位置编码，则按目标帧数做线性插值。
 - VideoLACT 从 image VideoViT 加载 patch embedding、`cls_token`、空间
   `pos_embed`、每层 window attention/norm、slow MLP、最终 norm 和形状兼容的
-  head。LACT 独有的 memory、fast weight 和新增 projection 保持新初始化。
+  head。LACT 独有的 memory、fast weight、`lr_proj` 以及 private 模式下的新增
+  projection 保持新初始化。
 - 分类与回归入口都必须让 `videolact_*` 使用独立空间/时间位置编码的 checkpoint
   插值分支，不能误走标准 VideoMAE 的联合位置编码分支。
 
@@ -190,11 +267,14 @@
 - VideoViT：SDPA 与显式 `softmax(QK^T/sqrt(d))V` 数值等价。
 - VideoViT：空间/时间位置编码插值后严格加载 checkpoint。
 - VideoLACT：CPU apply/update 前后向，window attention、fast weight、slow MLP、
-  value projection 均获得梯度；window/chunk 大小断言为单个 tubelet token 数。
-- VideoLACT：调用顺序严格为每个 tubelet 先 apply 所有层、再 update 所有层；
-  attention 实际输入长度始终等于 `tokens_per_tubelet`。
-- VideoLACT：fast-weight 的 apply/update/value/lr/output projection 均已检查，
-  与 window attention 不共享任何参数存储。
+  private/shared projection 与 `lr_proj` 均获得梯度；group size 1/2 的前后向以及
+  `chunk_size == window_size * fw_update_group_size` 已验证。
+- VideoLACT：layer-major 调度与原 tubelet-major apply-then-update 实现已做输出和
+  梯度等价检查；每层所有 window attention 合并为一次 `(B*T, 197, D)` SDPA，
+  fast-weight apply/update 仍按 tubelet 时间顺序串行。
+- VideoLACT：默认 private projection 路径及 shared projection 对照路径均已验证；
+  shared 模式下 Q/K/V 分别进入 FW apply/update/target，memory output 复用
+  attention out projection。
 - VideoLACT：Muon NS 输出与参考实现按 BF16 运算次序逐值一致；改变较早帧并
   保持最后一帧不变会改变最终预测，确认 fast weight 正在传递跨帧信息。
 - VideoLACT：GPU FP32、H100 BF16、apply/update gradient checkpoint 反向均
@@ -202,9 +282,30 @@
   真实尺寸推理。
 - Image ViT 初始化：VideoViT 和 VideoLACT 都已验证 2D patch kernel 中心膨胀、
   window QKV 逐值加载、类别头跳过以及 LACT-only 参数保持新初始化。
+- VideoLACT：默认 CUDA compiled 和 compiled+checkpoint 路径均已在 H100 BF16
+  验证，并确认生成 fused RMSNorm、SwiGLU/softplus backward、Muon bmm+norm 等
+  Triton kernel；整层 recurrent-scan checkpoint 已在 CPU private/shared 模式以及
+  H100 BF16 compiled private 模式验证，带 attention dropout/drop-path 时输出、输入
+  梯度和所有参数梯度均与 eager 路径逐值一致（最大差值 0）。
+- F64 Middle H100 BF16 训练步对照（224、400 类、dropout/drop-path 0、FP32 参数与
+  梯度、无 optimizer、全层 checkpoint、编译预热不计）：VideoViT 对 12,545
+  tokens 做 full attention；默认 private-proj VideoLACT 使用 64 个 197-token
+  window、`fw_update_group_size=8`（每层 8 group/7 update）。正式 outer-scan
+  checkpoint 下，相同 B8 的 ViT/LACT 为 1315/2071 ms、6.08/3.86 samples/s、
+  8.32/14.16 GiB；相同 B16 为 2619/3146 ms、6.11/5.09 samples/s、
+  16.26/27.76 GiB。B16 下 LACT step time 多约 20%、吞吐低约 17%，峰值显存为
+  1.71 倍；旧逐 update checkpoint 的 B16 峰值为 56.34 GiB、约 3.46 倍。
+- F64 LACT B16 显存归因：depth 32 为 56.33 GiB，完全相同配置改成 depth 8 仅
+  15.90 GiB；`residual_in_fp32` true/false 均为 15.90 GiB，当前峰值不是该开关
+  导致。depth-32 baseline 在 forward 结束时已常驻 55.16 GiB，backward 只把峰值
+  增至 56.33 GiB，说明逐 update checkpoint 仍保留了 32 层的 fast/master state
+  历史。现已正式把 checkpoint 边界扩大到每层完整 8-group recurrent scan，峰值
+  降到 27.76 GiB（-50.7%）；稳定复测 step 约 3.15 s，相比旧路径约 2.81 s 慢
+  约 12%。`use_checkpoint/checkpoint_num` 现在控制整层 scan checkpoint。
 - Middle 缩放：`dim=432`、`depth=32`、9 heads 配置下，Image ViT 为
-  78,569,704 参数，VideoViT 为 78,573,160 参数，VideoLACT 为 138,348,136 参数；
-  image checkpoint 与两个视频模型的 78,237,928 个共享参数形状已逐项验证兼容。
+  78,569,704 参数，VideoViT 为 78,573,160 参数；默认 private-proj VideoLACT 为
+  138,348,136 参数，shared-proj 对照为 114,460,264 参数。image checkpoint 与
+  两个视频模型的共享参数形状已逐项验证兼容。
 - W&B：已用 offline run 验证 image/video logger 生命周期、batch/epoch scalar
   上报、CLI 默认 entity/project、run name 必填、`WANDB_BASE_URL` 清除后选择
   `https://api.wandb.ai`，以及非主 rank 不初始化 run。

@@ -59,7 +59,19 @@ def get_args():
     parser.add_argument('--fw_inter_multi', type=float, default=2.0)
     parser.add_argument('--fw_num_heads', type=int, default=1)
     parser.add_argument('--fw_base_lr', type=float, default=0.01)
+    parser.add_argument(
+        '--fw_update_group_size', type=int, default=1,
+        help='Embedded tubelets per fast-weight apply/update group (default: 1)',
+    )
     parser.add_argument('--muon_update_steps', type=int, default=5)
+    share_proj_group = parser.add_mutually_exclusive_group()
+    share_proj_group.add_argument(
+        '--share_proj', dest='share_proj', action='store_true'
+    )
+    share_proj_group.add_argument(
+        '--no_share_proj', dest='share_proj', action='store_false'
+    )
+    parser.set_defaults(share_proj=False)
 
     parser.add_argument('--disable_eval_during_finetuning', action='store_true', default=False)
     parser.add_argument('--model_ema', action='store_true', default=False)
@@ -406,7 +418,9 @@ def main(args, ds_init):
             fw_inter_multi=args.fw_inter_multi,
             fw_num_heads=args.fw_num_heads,
             fw_base_lr=args.fw_base_lr,
+            fw_update_group_size=args.fw_update_group_size,
             muon_update_steps=args.muon_update_steps,
+            share_proj=args.share_proj,
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )
