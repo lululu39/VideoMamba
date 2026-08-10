@@ -265,6 +265,7 @@ class WandbLogger(object):
             "project": args.wandb_project,
             "name": args.wandb_run_name,
             "config": vars(args),
+            "settings": wandb.Settings(base_url="https://api.wandb.ai"),
         }
         if args.output_dir:
             init_kwargs["dir"] = args.output_dir

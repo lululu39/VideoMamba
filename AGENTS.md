@@ -241,6 +241,40 @@
   首次 F8 run 完全相同。`layer_decay=1.0` 会关闭 `LayerDecayValueAssigner`，所有层
   使用相同的 scheduler LR。ImageNet 预训练入口不使用 `video_sm` 的这套 layer-wise
   LR decay。
+- K400 VideoLACT-Middle F8 no-layer-decay run 为
+  `video-lact-middle-k400-f8x224-no-ld`，入口脚本是
+  `videomamba/video_sm/exp/k400/videolact_middle/run_f8x224_no_ld.sh`，公网 W&B run
+  为 `https://wandb.ai/LVSM-Experiment/videosft/runs/da1r720a`。除模型外沿用对应
+  VideoViT F8 no-LD recipe：每卡 `batch_size=32`、`update_freq=2`、
+  `num_sample=2`、8 帧、base LR `2e-4`、layer decay 1.0；LACT 使用 private
+  projection、`fw_update_group_size=1`，即每个 sampled frame 是一个 197-token
+  attention/FW group，共 8 group/7 次有效 state update。真实 B64 不使用 checkpoint
+  时首个 forward 在约 79.15 GiB OOM，因此该脚本必须启用 32 层完整 scan
+  checkpoint；这是与 ViT recipe 的执行差异。单卡完整 AdamW step 验证为约
+  5.70 s/33.64 GiB；正式八卡 run 于 2026-08-10 实测稳态约
+  6.07 s/micro-step，PyTorch peak 35.59 GiB、`nvidia-smi` 约 39.03 GiB/卡，因
+  训练耗时不可接受在约 32 分钟后主动停止。所有 rank/GPU 已释放，未产生 epoch
+  checkpoint，不得自动恢复该次尝试。
+- K400 F64 no-layer-decay VideoViT/VideoLACT recipe 已分别准备在
+  `videomamba/video_sm/exp/k400/videovit_middle/run_f64x224_no_ld.sh` 和
+  `videomamba/video_sm/exp/k400/videolact_middle/run_f64x224_no_ld.sh`，run name 为
+  `video-vit-middle-k400-f64x224-no-ld-2ep` 与
+  `video-lact-middle-k400-f64x224-no-ld-2ep`。两者沿原 VideoMamba F64 recipe 使用
+  每卡 `batch_size=4`、`num_sample=2`、64 帧、224²、tubelet size 1、drop path 0.8，
+  并显式设置 `layer_decay=1.0` 和 32 层完整 activation checkpoint；12 小时快速对照
+  将 schedule 压缩为 2 epochs/15,026 optimizer steps，其中 1,500 steps warmup，
+  CLI `lr/warmup_lr/min_lr=4e-4/4e-6/4e-6`，按当前 global batch 缩放后的实际值为
+  `1e-4/1e-6/1e-6`。LACT 额外使用 private projection、
+  `fw_update_group_size=8`，即 8 个 1576-token attention/FW group。VideoViT 曾于
+  2026-08-10 以旧 run name
+  `video-vit-middle-k400-f64x224-no-ld` 启动，公网 W&B run 为
+  `https://wandb.ai/LVSM-Experiment/videosft/runs/fxgm8m92`；实测每 epoch 训练约
+  2 小时 54 分、完整 50 epochs ETA 约 6.4 天，因耗时不可接受已在 epoch 0
+  step 397/7513 主动停止。所有 rank/GPU 已释放，未生成 epoch checkpoint，不得
+  自动恢复该次尝试。2-epoch VideoViT 已于 2026-08-10 启动，公网 W&B run 为
+  `https://wandb.ai/LVSM-Experiment/videosft/runs/we1s81t4`，tmux session/PID 为
+  `video-vit-middle-k400-f64x224-no-ld-2ep`/`2388158`；稳定 step time 约 1.40 秒，
+  PyTorch peak 9.20 GiB、`nvidia-smi` 约 14.04 GiB/卡。2-epoch LACT 尚未 launch。
 
 ## Weights & Biases 规则
 
@@ -254,7 +288,8 @@
   `--wandb-run-name <name>`。不要自行猜测、复用或覆盖 run name。
 - 本机环境可能把 `WANDB_BASE_URL` 指向内网。访问公网 W&B 时，启动命令必须在
   同一个 shell 中先显式执行 `unset WANDB_BASE_URL`，再启动训练；代码初始化时也
-  会再次移除该变量并打印 `unset WANDB_BASE_URL` 作为保障。
+  会再次移除该变量并打印 `unset WANDB_BASE_URL`，且向 `wandb.init` 显式传入
+  `https://api.wandb.ai` settings，避免用户级 W&B settings 重新选择内网 endpoint。
 - 不要 unset `WANDB_API_KEY`，也不要在日志、命令输出、文档或提交中打印、记录
   或泄露其值。
 - 标准启动形式为：先执行 `unset WANDB_BASE_URL`，再为训练命令加入 `--wandb`
@@ -298,6 +333,12 @@
   3.01 倍 step time、2.03 倍显存；F64 为 1315/2181 ms、6.08/3.67 clips/s、
   8.32/14.16 GiB，LACT 是 1.66 倍 step time、1.70 倍显存。ViT 分别对
   6,273/12,545 tokens 做 full attention。
+- F64 launch-setting 单 H100 验证进一步加载了正式 ImageViT checkpoint，并把
+  label-smoothed loss、AdamW step 以及初始化后的一阶/二阶 optimizer state 计入
+  峰值；脚本 `batch_size=4,num_sample=2` 在 collate 后实际进入模型 B8。VideoViT
+  为 1314 ms/6.09 clips/s/8.91 GiB，VideoLACT 为
+  2258 ms/3.54 clips/s/15.21 GiB。两者均连续完成 5 个计时训练步，距 80 GiB
+  单卡容量有充足余量；该测试不含 DDP bucket、视频解码和 dataloader。
 - 改成 grouped attention window 之前，F64 private-proj LACT 的 197-token
   per-tubelet window 在 B8 为约 2071 ms/14.16 GiB；扩大为 1576-token window 后
   为约 2181 ms/14.16 GiB，即显存基本不变、step time 增加约 5%。旧逐 update
