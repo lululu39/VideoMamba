@@ -390,6 +390,14 @@ class LACTBlock(nn.Module):
             if share_proj
             else nn.Linear(dim, dim, bias=False, **factory_kwargs)
         )
+        # Shared projection mode cannot zero mixer.out_proj without also
+        # disabling the pretrained attention branch. A zero-initialized
+        # channel gate keeps only the newly added memory residual at zero.
+        self.memory_gate = (
+            nn.Parameter(torch.zeros(dim, **factory_kwargs))
+            if share_proj
+            else None
+        )
         self.lr_proj = nn.Linear(dim, 3, bias=False, **factory_kwargs)
         self.base_lr_inverse = inverse_softplus(fw_base_lr)
         self.muon_update_steps = muon_update_steps
@@ -517,6 +525,7 @@ class LACTBlock(nn.Module):
             memory_output = self.mixer.proj_drop(
                 self.mixer.out_proj(memory_output)
             )
+            memory_output = memory_output * self.memory_gate
         else:
             key = target = memory_input
             memory_output = self.memory(memory_input, (w0, w1, w2))
@@ -909,8 +918,7 @@ class VisionLACT(nn.Module):
         )
         # Keep the newly added private memory branch function-preserving when
         # the shared trunk is initialized from an image VideoViT checkpoint.
-        # The output projection learns first; gradients reach the upstream
-        # fast-weight path once this projection becomes non-zero.
+        # Shared mode achieves the same behavior through its memory-only gate.
         for layer in self.layers:
             if layer.memory.output_proj is not None:
                 nn.init.zeros_(layer.memory.output_proj.weight)

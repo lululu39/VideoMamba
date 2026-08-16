@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_NAME="video-lact-middle-k400-f64x224-no-ld-10ep-zero-mem-out"
+RUN_NAME="video-lact-middle-k400-f64x224-no-ld-10ep-zero-mem-shared-proj"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_SM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_DIR="/mnt/localssd/experiments/videovit/${RUN_NAME}"
@@ -63,7 +63,7 @@ exec "${CONDA_PREFIX}/bin/torchrun" \
     --opt_betas 0.9 0.999 \
     --weight_decay 0.05 \
     --fw_update_group_size 8 \
-    --no_share_proj \
+    --share_proj \
     --use_checkpoint \
     --checkpoint_num 32 \
     --test_num_segment 4 \
