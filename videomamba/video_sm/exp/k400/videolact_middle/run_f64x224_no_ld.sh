@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_NAME="video-lact-middle-k400-f64x224-no-ld-10ep"
+RUN_NAME="video-lact-middle-k400-f64x224-no-ld-10ep-zero-mem-out"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_SM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_DIR="/mnt/localssd/experiments/videovit/${RUN_NAME}"

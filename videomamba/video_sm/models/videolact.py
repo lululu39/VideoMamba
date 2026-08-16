@@ -907,6 +907,13 @@ class VisionLACT(nn.Module):
                 **(initializer_cfg if initializer_cfg is not None else {}),
             )
         )
+        # Keep the newly added private memory branch function-preserving when
+        # the shared trunk is initialized from an image VideoViT checkpoint.
+        # The output projection learns first; gradients reach the upstream
+        # fast-weight path once this projection becomes non-zero.
+        for layer in self.layers:
+            if layer.memory.output_proj is not None:
+                nn.init.zeros_(layer.memory.output_proj.weight)
 
     @torch.jit.ignore
     def no_weight_decay(self):
