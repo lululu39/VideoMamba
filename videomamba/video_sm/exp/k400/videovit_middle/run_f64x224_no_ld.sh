@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_NAME="video-vit-middle-k400-f64x224-no-ld-2ep"
+RUN_NAME="video-vit-middle-k400-f64x224-no-ld-10ep"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_SM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_DIR="/mnt/localssd/experiments/videovit/${RUN_NAME}"
@@ -28,7 +28,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 MASTER_PORT="${MASTER_PORT:-$((12000 + RANDOM % 20000))}"
 
 cd "${VIDEO_SM_DIR}"
-exec torchrun \
+exec "${CONDA_PREFIX}/bin/torchrun" \
     --nnodes=1 \
     --nproc-per-node=8 \
     --master-addr=127.0.0.1 \
@@ -51,12 +51,11 @@ exec torchrun \
     --num_frames 64 \
     --num_workers 12 \
     --warmup_epochs 1 \
-    --warmup_steps 1500 \
     --tubelet_size 1 \
-    --epochs 2 \
-    --lr 4e-4 \
-    --warmup_lr 4e-6 \
-    --min_lr 4e-6 \
+    --epochs 10 \
+    --lr 2e-4 \
+    --warmup_lr 2e-6 \
+    --min_lr 2e-6 \
     --layer_decay 1.0 \
     --drop_path 0.8 \
     --mlp_ratio 3.0 \
