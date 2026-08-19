@@ -285,17 +285,17 @@
   6.07 s/micro-step，PyTorch peak 35.59 GiB、`nvidia-smi` 约 39.03 GiB/卡，因
   训练耗时不可接受在约 32 分钟后主动停止。所有 rank/GPU 已释放，未产生 epoch
   checkpoint，不得自动恢复该次尝试。
-- K400 F64 no-layer-decay VideoViT/VideoLACT recipe 已分别准备在
+- K400 F64 no-layer-decay VideoViT/VideoLACT 当前 recipe 分别位于
   `videomamba/video_sm/exp/k400/videovit_middle/run_f64x224_no_ld.sh` 和
   `videomamba/video_sm/exp/k400/videolact_middle/run_f64x224_no_ld.sh`，run name 为
-  `video-vit-middle-k400-f64x224-no-ld-2ep` 与
-  `video-lact-middle-k400-f64x224-no-ld-2ep`。两者沿原 VideoMamba F64 recipe 使用
-  每卡 `batch_size=4`、`num_sample=2`、64 帧、224²、tubelet size 1、drop path 0.8，
-  并显式设置 `layer_decay=1.0` 和 32 层完整 activation checkpoint；12 小时快速对照
-  将 schedule 压缩为 2 epochs/15,026 optimizer steps，其中 1,500 steps warmup，
-  CLI `lr/warmup_lr/min_lr=4e-4/4e-6/4e-6`，按当前 global batch 缩放后的实际值为
-  `1e-4/1e-6/1e-6`。LACT 额外使用 private projection、
-  `fw_update_group_size=8`，即 8 个 1576-token attention/FW group。VideoViT 曾于
+  `video-vit-middle-k400-f64x224-no-ld-10ep` 与
+  `video-lact-middle-k400-f64x224-no-ld-10ep-zero-mem-shared-proj`。两者沿原
+  VideoMamba F64 recipe 使用每卡 `batch_size=4`、`num_sample=2`、64 帧、224²、
+  tubelet size 1、drop path 0.8，并显式设置 `layer_decay=1.0` 和 32 层 activation
+  checkpoint；当前 schedule 为 10 epochs、每 epoch 7,513 optimizer steps、warmup
+  1 epoch。CLI `lr/warmup_lr/min_lr=2e-4/2e-6/2e-6`，按当前 batch 及 repeated sample
+  缩放后的实际值为 `5e-5/5e-7/5e-7`。LACT 使用 `fw_update_group_size=8`，即 8 个
+  1576-token attention/FW group。VideoViT 曾于
   2026-08-10 以旧 run name
   `video-vit-middle-k400-f64x224-no-ld` 启动，公网 W&B run 为
   `https://wandb.ai/LVSM-Experiment/videosft/runs/fxgm8m92`；实测每 epoch 训练约
@@ -311,6 +311,19 @@
   于 2026-08-19 epoch 9 step 6750/7513 按用户要求用 SIGTERM 正常关闭，以释放 GPU
   做 cross-layer benchmark；launcher、8 个 rank、tmux session 和 GPU watchdog 均已
   结束，8 张卡无残留计算进程。未完成 epoch 9 和最终 test，不得自动恢复。
+- private-proj + share-init + strict cross-layer G4 的 F64 v2 run 脚本为
+  `videomamba/video_sm/exp/k400/videolact_middle/run_f64x224_no_ld_v2.sh`，run name
+  `video-lact-middle-k400-f64x224-no-ld-10ep-zero-mem-shared-proj-v2` 按用户要求只在
+  旧名字后追加 v2；名字虽保留 `shared-proj` 历史字段，实际参数明确为
+  `share_proj=False, share_init=True, fw_update_layer_group_size=4`。公网 W&B run 为
+  `https://wandb.ai/LVSM-Experiment/videosft/runs/x4rbquus`；于 2026-08-19 启动，
+  training/guard tmux session 分别与 run name 相同及追加 `-guard`，launcher PID
+  为 `2639832`。guard 每 5 秒检查 8 张 GPU，只保留 launcher 后代，启动初期已终止
+  多个外来 GPU 任务。首次 compiled step 约 55.7 秒必须从 ETA 排除；step 80--113
+  稳态约 `1.76--1.78 s/step`，日志 PyTorch peak `28,736 MiB`、`nvidia-smi` 每卡约
+  `35.0 GiB`，grad norm 约 4.17。纯训练每 epoch 预计约 3 小时 42 分，含 single-view
+  validation/checkpoint 约 3 小时 45--50 分；10 epochs 加最终 12-view test 的完整
+  ETA 约 38--40 小时（假设 guard 持续阻止 GPU 抢占）。
 
 ## Weights & Biases 规则
 
