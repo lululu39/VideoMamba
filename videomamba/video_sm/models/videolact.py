@@ -646,6 +646,70 @@ class LACTBlock(nn.Module):
             return self._compiled_memory_mlp_chunk(x, *fast_weights)
         return self._apply_memory_mlp_chunk(x, *fast_weights)
 
+    def _apply_window_memory_mlp_chunk(
+        self,
+        x,
+        window_group_size,
+        w0,
+        w1,
+        w2,
+    ):
+        """Apply one reference-style attention/memory/slow-MLP chunk."""
+        x = self._apply_window_attention(x, window_group_size)
+        return self._apply_memory_mlp_chunk(x, w0, w1, w2)
+
+    @torch.compile
+    def _compiled_window_memory_mlp_chunk(
+        self,
+        x,
+        window_group_size,
+        *fast_weights,
+    ):
+        return self._apply_window_memory_mlp_chunk(
+            x,
+            window_group_size,
+            *fast_weights,
+        )
+
+    @torch.compile
+    def _compiled_checkpoint_window_memory_mlp_chunk(
+        self,
+        x,
+        window_group_size,
+        *fast_weights,
+    ):
+        return checkpoint.checkpoint(
+            self._apply_window_memory_mlp_chunk,
+            x,
+            window_group_size,
+            *fast_weights,
+            preserve_rng_state=True,
+            use_reentrant=False,
+        )
+
+    def apply_window_memory_mlp_chunk(
+        self,
+        x,
+        window_group_size,
+        fast_weights,
+        use_checkpoint=False,
+    ):
+        args = (x, window_group_size, *fast_weights)
+        if use_checkpoint:
+            if x.is_cuda:
+                return self._compiled_checkpoint_window_memory_mlp_chunk(
+                    *args
+                )
+            return checkpoint.checkpoint(
+                self._apply_window_memory_mlp_chunk,
+                *args,
+                preserve_rng_state=True,
+                use_reentrant=False,
+            )
+        if x.is_cuda:
+            return self._compiled_window_memory_mlp_chunk(*args)
+        return self._apply_window_memory_mlp_chunk(*args)
+
     def _apply_chunk(self, x, w0, w1, w2):
         x = self._apply_window_attention(x.unsqueeze(1)).squeeze(1)
         return self._apply_memory_mlp_chunk(x, w0, w1, w2)
@@ -1147,6 +1211,15 @@ class VisionLACT(nn.Module):
     def _compiled_batched_update_fast_weights(self, *args):
         return self._batched_update_fast_weights(*args)
 
+    @torch.compile
+    def _compiled_checkpoint_batched_update_fast_weights(self, *args):
+        return checkpoint.checkpoint(
+            self._batched_update_fast_weights,
+            *args,
+            preserve_rng_state=False,
+            use_reentrant=False,
+        )
+
     def _update_layer_group(
         self,
         layers,
@@ -1154,6 +1227,7 @@ class VisionLACT(nn.Module):
         fast_weights,
         master_weights,
         update_parameters,
+        use_checkpoint=False,
     ):
         memory_inputs = torch.stack([record[0] for record in update_records])
         lr_weights, update_weights, value_weights = update_parameters
@@ -1184,7 +1258,21 @@ class VisionLACT(nn.Module):
         # group runs eagerly, while every full group still uses the compiled
         # batched update.
         full_group = len(layers) == self.fw_update_layer_group_size
-        if memory_inputs.is_cuda and full_group:
+        if use_checkpoint:
+            if memory_inputs.is_cuda and full_group:
+                outputs = (
+                    self._compiled_checkpoint_batched_update_fast_weights(
+                        *args
+                    )
+                )
+            else:
+                outputs = checkpoint.checkpoint(
+                    self._batched_update_fast_weights,
+                    *args,
+                    preserve_rng_state=False,
+                    use_reentrant=False,
+                )
+        elif memory_inputs.is_cuda and full_group:
             outputs = self._compiled_batched_update_fast_weights(*args)
         else:
             outputs = self._batched_update_fast_weights(*args)
@@ -1219,18 +1307,48 @@ class VisionLACT(nn.Module):
             )
         return lr_weights, update_weights, value_weights
 
-    def _forward_layer_group_scan(self, x, layer_start, layer_end):
-        """Run a temporal scan while batching updates across several layers."""
-        layers = self.layers[layer_start:layer_end]
+    def _iter_cross_layer_groups(self):
+        for layer_start in range(
+            0,
+            len(self.layers),
+            self.fw_update_layer_group_size,
+        ):
+            yield (
+                layer_start,
+                min(
+                    layer_start + self.fw_update_layer_group_size,
+                    len(self.layers),
+                ),
+            )
+
+    def _forward_cross_layer_scan(self, x):
+        """Run the strict reference chunk-major cross-layer schedule."""
         batch_size, tubelets, _, _ = x.shape
-        fast_weights, master_weights = self._init_layer_group_fast_weights(
-            layers,
-            batch_size,
-        )
-        update_parameters = self._stack_layer_group_update_parameters(
-            layers,
-            x,
-        )
+
+        layer_groups = []
+        layer_states = []
+        for layer_start, layer_end in self._iter_cross_layer_groups():
+            layers = self.layers[layer_start:layer_end]
+            fast_weights, master_weights = (
+                self._init_layer_group_fast_weights(layers, batch_size)
+            )
+            layer_groups.append(
+                {
+                    "start": layer_start,
+                    "end": layer_end,
+                    "layers": layers,
+                    "fast_weights": fast_weights,
+                    "master_weights": master_weights,
+                    "update_parameters": (
+                        self._stack_layer_group_update_parameters(layers, x)
+                    ),
+                }
+            )
+            layer_states.extend(
+                (len(layer_groups) - 1, layer_index)
+                for layer_index in range(len(layers))
+            )
+
         group_outputs = []
         for group_start in range(0, tubelets, self.fw_update_group_size):
             group_end = min(
@@ -1239,75 +1357,45 @@ class VisionLACT(nn.Module):
             )
             hidden_states = x[:, group_start:group_end]
             update_records = []
-            for layer_index, layer in enumerate(layers):
-                hidden_states = layer.apply_window_attention(
-                    hidden_states,
-                    window_group_size=self.fw_update_group_size,
-                    use_checkpoint=False,
-                )
+            for layer_index, layer in enumerate(self.layers):
+                state_group_index, state_layer_index = layer_states[layer_index]
+                state_group = layer_groups[state_group_index]
                 hidden_states, memory_input, key, target = (
-                    layer.apply_memory_mlp_chunk(
+                    layer.apply_window_memory_mlp_chunk(
                         hidden_states,
-                        tuple(
-                            weight[layer_index] for weight in fast_weights
+                        window_group_size=self.fw_update_group_size,
+                        fast_weights=tuple(
+                            weight[state_layer_index]
+                            for weight in state_group["fast_weights"]
                         ),
-                        use_checkpoint=False,
+                        use_checkpoint=(
+                            self.use_checkpoint
+                            and layer_index < self.checkpoint_num
+                        ),
                     )
                 )
                 update_records.append((memory_input, key, target))
+
             if group_end < tubelets:
-                fast_weights, master_weights = self._update_layer_group(
-                    layers,
-                    update_records,
-                    fast_weights,
-                    master_weights,
-                    update_parameters,
-                )
+                for state_group in layer_groups:
+                    layer_start = state_group["start"]
+                    layer_end = state_group["end"]
+                    fast_weights, master_weights = self._update_layer_group(
+                        state_group["layers"],
+                        update_records[layer_start:layer_end],
+                        state_group["fast_weights"],
+                        state_group["master_weights"],
+                        state_group["update_parameters"],
+                        use_checkpoint=(
+                            self.use_checkpoint
+                            and layer_start < self.checkpoint_num
+                        ),
+                    )
+                    state_group["fast_weights"] = fast_weights
+                    state_group["master_weights"] = master_weights
+
             group_outputs.append(hidden_states)
         return torch.cat(group_outputs, dim=1)
-
-    def _forward_layer_group(
-        self,
-        x,
-        layer_start,
-        layer_end,
-        use_checkpoint,
-    ):
-        if not use_checkpoint:
-            return self._forward_layer_group_scan(x, layer_start, layer_end)
-
-        def checkpointed_scan(layer_input):
-            return self._forward_layer_group_scan(
-                layer_input,
-                layer_start,
-                layer_end,
-            )
-
-        return checkpoint.checkpoint(
-            checkpointed_scan,
-            x,
-            preserve_rng_state=True,
-            use_reentrant=False,
-        )
-
-    def _iter_cross_layer_groups(self):
-        depth = len(self.layers)
-        boundaries = [0, depth]
-        if self.use_checkpoint and 0 < self.checkpoint_num < depth:
-            boundaries.insert(1, self.checkpoint_num)
-        for boundary_start, boundary_end in zip(boundaries, boundaries[1:]):
-            for layer_start in range(
-                boundary_start,
-                boundary_end,
-                self.fw_update_layer_group_size,
-            ):
-                yield (
-                    layer_start,
-                    min(
-                        layer_start + self.fw_update_layer_group_size,
-                        boundary_end,
-                    ),
-                )
 
     def forward_features(self, x):
         x = self.patch_embed(x)
@@ -1341,19 +1429,11 @@ class VisionLACT(nn.Module):
                     use_checkpoint=use_checkpoint,
                 )
         else:
-            # Group-major within each layer group allows the independent
-            # fast-weight updates of those layers to share large GEMMs. The
-            # complete multi-layer recurrent scan is one checkpoint boundary.
-            for layer_start, layer_end in self._iter_cross_layer_groups():
-                x = self._forward_layer_group(
-                    x,
-                    layer_start,
-                    layer_end,
-                    use_checkpoint=(
-                        self.use_checkpoint
-                        and layer_end <= self.checkpoint_num
-                    ),
-                )
+            # Match the reference implementation: each temporal chunk passes
+            # through every layer before independent layer states are updated
+            # in batches. Checkpoint boundaries are the per-layer chunk apply
+            # and each batched fast-weight update, not the complete scan.
+            x = self._forward_cross_layer_scan(x)
 
         x = self.norm_f(
             x.to(dtype=self.norm_f.weight.dtype)

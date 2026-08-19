@@ -64,8 +64,10 @@ def get_args():
     parser.add_argument(
         '--fw_update_layer_group_size', type=int, default=1,
         help=(
-            'Consecutive LACT layers whose independent fast-weight updates '
-            'are batched together (default: 1)'
+            'LACT fast-weight update layer batch. 1 keeps the optimized '
+            'layer-major scan; values >1 select the reference chunk-major '
+            'scan and batch this many layer updates (use model depth to '
+            'batch all layers; default: 1)'
         ),
     )
     parser.add_argument('--muon_update_steps', type=int, default=5)
