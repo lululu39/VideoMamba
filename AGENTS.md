@@ -57,6 +57,15 @@
   depth-group scan；`G=depth` 才是所有层一次 update。非完整尾部 layer batch 使用
   eager update，避免完整/短尾动态 layer shape 在 checkpoint 重算时切换 compiled
   graph。
+- G1 与 G>1 在精确算术下是同一依赖图的合法拓扑排序：layer `l` 的 state 只依赖
+  该 layer 上一个 temporal chunk，不能被其他 layer 读写；cross-layer update 只是把
+  独立 layer 轴折入 BMM batch，不会混合 layer。window attention、memory apply、
+  slow MLP、apply-then-update 和最后一次 update 跳过的数学均不变。G1 分支仍直接调用
+  引入 cross-layer 之前的 `layer.forward_scan`，必须保持旧实现不变。CUDA BF16 因
+  SDPA/BMM batch shape 和 reduction 顺序不同不保证 bitwise parity；训练态 loop 换序
+  也会改变 dropout/drop-path 的 RNG 消费顺序，因此相同 seed 的逐 step trajectory
+  不要求相同，但随机分布和训练目标相同。每个 block checkpoint 必须保留 RNG state，
+  确保该路径 backward 重算使用与自身 forward 相同的 mask。
 - 每层 window attention 使用 `norm` 和 `mixer.qkv/out_proj` 命名，以便直接
   加载 image VideoViT 权重。默认 `share_proj=False`，fast-weight 分支保留独立
   `apply_proj`、`update_proj`、`value_proj` 和 `output_proj`；`share_proj=True`
@@ -348,14 +357,14 @@
   `7.5e-9`、参数梯度最大差约 `1.9e-6`；Dynamo 捕获为单图且无 graph break，
   private/share-init/shared 三条整层 checkpoint 路径均与 eager 逐值一致。
 - VideoLACT：严格参考 cross-layer 路径已验证 private/shared、非整除 temporal tail
-  和非完整 layer tail。CPU FP32 下，G1 原 layer-major 与 G2 严格 chunk-major 的
-  输出逐值一致，输入梯度最大差约 `9.6e-10`、参数梯度最大差约 `6.0e-8`；严格路径
-  eager 与参考粒度 checkpoint 在 attention dropout/drop-path 开启时输出、输入梯度
-  和全部参数梯度逐值一致。H100 BF16 下，compiled checkpoint 与 compiled eager
-  会因 checkpoint 图融合和 GEMM reduction 顺序产生舍入差（小模型无随机项输出最大
-  差约 `8.4e-3`），且原 layer-major/cross-layer 的 layer-batched Muon 也不能保证
-  bitwise parity；CPU 结果和逐层依赖检查确认 update 方程与 apply-then-update 数学
-  未改变。
+  和非完整 layer tail。当前 G1 与严格 G4 的 CPU FP32 回归在显式非零 memory output
+  下，private/shared 输出最大差均为 0，输入梯度最大差约 `5.8e-10/4.4e-11`，参数
+  梯度最大差约 `1.2e-7/1.5e-8`，且所有参数的 grad presence 一致；严格路径 eager
+  与参考粒度 checkpoint 在 attention dropout/drop-path 开启时输出、输入梯度和全部
+  参数梯度逐值一致。H100 BF16 下，compiled checkpoint 与 compiled eager 会因
+  checkpoint 图融合和 GEMM reduction 顺序产生舍入差（小模型无随机项输出最大差约
+  `8.4e-3`），且原 layer-major/cross-layer 的 layer-batched Muon 也不能保证 bitwise
+  parity；CPU 结果和逐层依赖检查确认 update 方程与 apply-then-update 数学未改变。
 - VideoLACT：Muon NS 输出与参考实现按 BF16 运算次序逐值一致；改变较早帧并
   保持最后一帧不变会改变最终预测，确认 fast weight 正在传递跨帧信息。
 - VideoLACT：GPU FP32、H100 BF16、apply/update gradient checkpoint 反向均
@@ -385,16 +394,16 @@
   2258 ms/3.54 clips/s/15.21 GiB。两者均连续完成 5 个计时训练步，距 80 GiB
   单卡容量有充足余量；该测试不含 DDP bucket、视频解码和 dataloader。
 - 严格参考 cross-layer batching 的单 H100 BF16 前后向对照使用 F64 production
-  shape `B8/depth32/8 temporal chunks/5-step Muon`。private-proj 的 G1 原路径与
-  G32（所有层一次 update）稳态中位数为 `1.9225/1.8670 s`，G32 吞吐提高约 3.0%，
-  PyTorch 峰值为 `14.25/45.57 GiB`；含 label-smoothed loss 和首次 AdamW state
-  分配的 G32 完整 step 峰值仍为 `45.57 GiB`，满足 80 GiB H100。严格 G4 虽只用
-  `26.55 GiB`，但因每个 temporal chunk 要执行 8 次小 batched-update/checkpoint，
-  前后向约 `5.03 s`；性能实验应直接用 `G=depth=32`，不能把旧 hybrid G4 结果外推
-  到严格路径。shared-proj G32 稳态约 `1.918 s/50.24 GiB`，相对其旧 G1 约
-  `1.895 s/14.22 GiB` 没有吞吐收益，但同样满足显存要求。cross-layer 的主要收益
-  来自把所有层 update GEMM 一次做满，代价是严格 chunk-major attention 和更长的
-  recurrent state autograd history；默认 G1 仍是省显存路径。
+  shape `B8/depth32/8 temporal chunks/5-step Muon`。必须丢弃首次 forward/backward 的
+  lazy compile，并关闭 Python GC 后交替执行 G1/G4，避免 GPU clock 漂移造成虚假差异。
+  private-proj 的 G1/G4 稳态中位数为 `1.6941/1.6139 s`，G4 提速 4.97%，PyTorch
+  峰值为 `14.25/26.54 GiB`；shared-proj 为 `1.7677/1.6685 s`，提速 5.94%，峰值
+  `14.21/33.49 GiB`。G sweep 的最优点是 G4；G8 已开始回退，G16/G32 更慢，G32
+  峰值达到 private/shared `45.57/50.24 GiB`。大于 G4 后 update GEMM 已饱和，继续
+  减少 launch 无法抵消更大中间张量的 cache/memory-bandwidth 压力。旧记录中 G4
+  `5.03 s` 是把首次 backward lazy compile 当作稳态，G32 推荐也不成立；F64 实验应
+  使用 `--fw_update_layer_group_size 4`。默认 G1 仍是最低显存且严格保持旧实现的
+  路径。
 - 改成 grouped attention window 之前，F64 private-proj LACT 的 197-token
   per-tubelet window 在 B8 为约 2071 ms/14.16 GiB；扩大为 1576-token window 后
   为约 2181 ms/14.16 GiB，即显存基本不变、step time 增加约 5%。旧逐 update
