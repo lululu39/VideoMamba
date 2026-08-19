@@ -63,6 +63,13 @@ def get_args():
         '--fw_update_group_size', type=int, default=1,
         help='Embedded tubelets per fast-weight apply/update group (default: 1)',
     )
+    parser.add_argument(
+        '--fw_update_layer_group_size', type=int, default=1,
+        help=(
+            'Consecutive LACT layers whose independent fast-weight updates '
+            'are batched together (default: 1)'
+        ),
+    )
     parser.add_argument('--muon_update_steps', type=int, default=5)
     share_proj_group = parser.add_mutually_exclusive_group()
     share_proj_group.add_argument(
@@ -428,6 +435,7 @@ def main(args, ds_init):
             fw_num_heads=args.fw_num_heads,
             fw_base_lr=args.fw_base_lr,
             fw_update_group_size=args.fw_update_group_size,
+            fw_update_layer_group_size=args.fw_update_layer_group_size,
             muon_update_steps=args.muon_update_steps,
             share_proj=args.share_proj,
             share_init=args.share_init,

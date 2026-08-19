@@ -257,13 +257,32 @@ class FastWeightSwiGLU(nn.Module):
         master_weights,
         muon_update_steps,
     ):
-        w0, w1, w2 = fast_weights
-        master_w0, master_w1, master_w2 = master_weights
-        batch_size, seq_len, _ = memory_input.shape
-
         key = memory_input
         if self.update_proj is not None:
             key = self.apply_norm(self.update_proj(key))
+        return self.update_preprojected(
+            key,
+            target,
+            learning_rates,
+            fast_weights,
+            master_weights,
+            muon_update_steps,
+        )
+
+    def update_preprojected(
+        self,
+        key,
+        target,
+        learning_rates,
+        fast_weights,
+        master_weights,
+        muon_update_steps,
+    ):
+        """Update fast weights after any layer-specific K/V projections."""
+        w0, w1, w2 = fast_weights
+        master_w0, master_w1, master_w2 = master_weights
+        batch_size, seq_len, _ = key.shape
+
         output, key_heads, gate, up, hidden = self._apply_fast_weights(
             key,
             fast_weights,
@@ -870,6 +889,7 @@ class VisionLACT(nn.Module):
         share_proj=False,
         share_init=False,
         fw_update_group_size=1,
+        fw_update_layer_group_size=1,
         device=None,
         dtype=None,
         use_checkpoint=False,
@@ -888,6 +908,11 @@ class VisionLACT(nn.Module):
             raise ValueError(
                 "fw_update_group_size must be positive, got "
                 f"{fw_update_group_size}"
+            )
+        if fw_update_layer_group_size <= 0:
+            raise ValueError(
+                "fw_update_layer_group_size must be positive, got "
+                f"{fw_update_layer_group_size}"
             )
         if share_proj and share_init:
             raise ValueError(
@@ -911,6 +936,7 @@ class VisionLACT(nn.Module):
         temporal_tokens = num_frames // kernel_size
         self.tokens_per_tubelet = self.patch_embed.num_patches + 1
         self.fw_update_group_size = int(fw_update_group_size)
+        self.fw_update_layer_group_size = int(fw_update_layer_group_size)
         self.chunk_size = self.tokens_per_tubelet * self.fw_update_group_size
         self.window_size = self.chunk_size
         self.cls_token = nn.Parameter(
@@ -1034,6 +1060,255 @@ class VisionLACT(nn.Module):
     def get_num_layers(self):
         return len(self.layers)
 
+    def _batched_update_fast_weights(
+        self,
+        memory_inputs,
+        keys,
+        targets,
+        w0,
+        w1,
+        w2,
+        master_w0,
+        master_w1,
+        master_w2,
+        lr_weights,
+        update_weights,
+        value_weights,
+        share_proj,
+    ):
+        """Update several layers together by folding layer into batch."""
+        num_layers, batch_size, seq_len, dim = memory_inputs.shape
+        prediction_inputs = F.rms_norm(
+            memory_inputs,
+            normalized_shape=(dim,),
+            eps=1e-5,
+        )
+        with torch.autocast(
+            device_type=memory_inputs.device.type,
+            enabled=False,
+        ):
+            learning_rates = torch.bmm(
+                prediction_inputs.float().reshape(
+                    num_layers,
+                    batch_size * seq_len,
+                    dim,
+                ),
+                lr_weights.float().transpose(1, 2),
+            ).reshape(num_layers, batch_size, seq_len, 3)
+            learning_rates = F.softplus(
+                learning_rates + self.layers[0].base_lr_inverse
+            )
+
+        if not share_proj:
+            targets = torch.bmm(
+                prediction_inputs.reshape(
+                    num_layers,
+                    batch_size * seq_len,
+                    dim,
+                ),
+                value_weights.transpose(1, 2),
+            ).reshape(num_layers, batch_size, seq_len, dim)
+            keys = torch.bmm(
+                memory_inputs.reshape(
+                    num_layers,
+                    batch_size * seq_len,
+                    dim,
+                ),
+                update_weights.transpose(1, 2),
+            ).reshape(num_layers, batch_size, seq_len, dim)
+            keys = F.rms_norm(
+                F.silu(keys),
+                normalized_shape=(dim,),
+                eps=1e-5,
+            )
+
+        fast_weights, master_weights = self.layers[0].memory.update_preprojected(
+            keys.flatten(0, 1),
+            targets.flatten(0, 1),
+            learning_rates.flatten(0, 1),
+            tuple(weight.flatten(0, 1) for weight in (w0, w1, w2)),
+            tuple(
+                weight.flatten(0, 1)
+                for weight in (master_w0, master_w1, master_w2)
+            ),
+            self.layers[0].muon_update_steps,
+        )
+        fast_weights = tuple(
+            weight.reshape(num_layers, batch_size, *weight.shape[1:])
+            for weight in fast_weights
+        )
+        master_weights = tuple(
+            weight.reshape(num_layers, batch_size, *weight.shape[1:])
+            for weight in master_weights
+        )
+        return (*fast_weights, *master_weights)
+
+    @torch.compile
+    def _compiled_batched_update_fast_weights(self, *args):
+        return self._batched_update_fast_weights(*args)
+
+    def _update_layer_group(
+        self,
+        layers,
+        update_records,
+        fast_weights,
+        master_weights,
+        update_parameters,
+    ):
+        memory_inputs = torch.stack([record[0] for record in update_records])
+        lr_weights, update_weights, value_weights = update_parameters
+        if layers[0].share_proj:
+            keys = torch.stack([record[1] for record in update_records])
+            targets = torch.stack([record[2] for record in update_records])
+        else:
+            # Private K/V are projected below from memory_inputs. Avoid two
+            # redundant copies of the large [layer, batch, tokens, dim]
+            # tensor merely to satisfy a common call signature.
+            keys = memory_inputs.new_empty(len(layers), 0, 0, 0)
+            targets = memory_inputs.new_empty(len(layers), 0, 0, 0)
+        args = (
+            memory_inputs,
+            keys,
+            targets,
+            *fast_weights,
+            *master_weights,
+            lr_weights,
+            update_weights,
+            value_weights,
+            layers[0].share_proj,
+        )
+        # Keep the compiled callable on one static layer-batch shape. A short
+        # tail group would otherwise make Dynamo switch this callable to a
+        # dynamic graph; non-reentrant checkpoint recomputation can then pick
+        # a different cached graph and fail its metadata check. The one tail
+        # group runs eagerly, while every full group still uses the compiled
+        # batched update.
+        full_group = len(layers) == self.fw_update_layer_group_size
+        if memory_inputs.is_cuda and full_group:
+            outputs = self._compiled_batched_update_fast_weights(*args)
+        else:
+            outputs = self._batched_update_fast_weights(*args)
+
+        return outputs[:3], outputs[3:]
+
+    @staticmethod
+    def _init_layer_group_fast_weights(layers, batch_size):
+        layer_states = [layer.init_fast_weights(batch_size) for layer in layers]
+        fast_weights = tuple(
+            torch.stack([state[0][index] for state in layer_states])
+            for index in range(3)
+        )
+        master_weights = tuple(
+            torch.stack([state[1][index] for state in layer_states])
+            for index in range(3)
+        )
+        return fast_weights, master_weights
+
+    @staticmethod
+    def _stack_layer_group_update_parameters(layers, reference):
+        lr_weights = torch.stack([layer.lr_proj.weight for layer in layers])
+        if layers[0].share_proj:
+            update_weights = reference.new_empty(len(layers), 0, 0)
+            value_weights = reference.new_empty(len(layers), 0, 0)
+        else:
+            update_weights = torch.stack(
+                [layer.memory.update_proj[0].weight for layer in layers]
+            )
+            value_weights = torch.stack(
+                [layer.value_proj.weight for layer in layers]
+            )
+        return lr_weights, update_weights, value_weights
+
+    def _forward_layer_group_scan(self, x, layer_start, layer_end):
+        """Run a temporal scan while batching updates across several layers."""
+        layers = self.layers[layer_start:layer_end]
+        batch_size, tubelets, _, _ = x.shape
+        fast_weights, master_weights = self._init_layer_group_fast_weights(
+            layers,
+            batch_size,
+        )
+        update_parameters = self._stack_layer_group_update_parameters(
+            layers,
+            x,
+        )
+        group_outputs = []
+        for group_start in range(0, tubelets, self.fw_update_group_size):
+            group_end = min(
+                group_start + self.fw_update_group_size,
+                tubelets,
+            )
+            hidden_states = x[:, group_start:group_end]
+            update_records = []
+            for layer_index, layer in enumerate(layers):
+                hidden_states = layer.apply_window_attention(
+                    hidden_states,
+                    window_group_size=self.fw_update_group_size,
+                    use_checkpoint=False,
+                )
+                hidden_states, memory_input, key, target = (
+                    layer.apply_memory_mlp_chunk(
+                        hidden_states,
+                        tuple(
+                            weight[layer_index] for weight in fast_weights
+                        ),
+                        use_checkpoint=False,
+                    )
+                )
+                update_records.append((memory_input, key, target))
+            if group_end < tubelets:
+                fast_weights, master_weights = self._update_layer_group(
+                    layers,
+                    update_records,
+                    fast_weights,
+                    master_weights,
+                    update_parameters,
+                )
+            group_outputs.append(hidden_states)
+        return torch.cat(group_outputs, dim=1)
+
+    def _forward_layer_group(
+        self,
+        x,
+        layer_start,
+        layer_end,
+        use_checkpoint,
+    ):
+        if not use_checkpoint:
+            return self._forward_layer_group_scan(x, layer_start, layer_end)
+
+        def checkpointed_scan(layer_input):
+            return self._forward_layer_group_scan(
+                layer_input,
+                layer_start,
+                layer_end,
+            )
+
+        return checkpoint.checkpoint(
+            checkpointed_scan,
+            x,
+            preserve_rng_state=True,
+            use_reentrant=False,
+        )
+
+    def _iter_cross_layer_groups(self):
+        depth = len(self.layers)
+        boundaries = [0, depth]
+        if self.use_checkpoint and 0 < self.checkpoint_num < depth:
+            boundaries.insert(1, self.checkpoint_num)
+        for boundary_start, boundary_end in zip(boundaries, boundaries[1:]):
+            for layer_start in range(
+                boundary_start,
+                boundary_end,
+                self.fw_update_layer_group_size,
+            ):
+                yield (
+                    layer_start,
+                    min(
+                        layer_start + self.fw_update_layer_group_size,
+                        boundary_end,
+                    ),
+                )
+
     def forward_features(self, x):
         x = self.patch_embed(x)
         batch_size, channels, tubelets, height, width = x.shape
@@ -1054,21 +1329,31 @@ class VisionLACT(nn.Module):
         x = x + self.temporal_pos_embedding.unsqueeze(2)
         x = self.pos_drop(x)
 
-        # Process layers outermost so every layer can evaluate all independent
-        # FW-group-sized attention windows in one batched SDPA call. Fast
-        # weights are still applied and updated recurrently, in temporal group
-        # order, within each layer. Since fast-weight state is private to a
-        # layer, this is the same dependency graph as the corresponding
-        # group-major schedule.
-        for layer_index, layer in enumerate(self.layers):
-            use_checkpoint = (
-                self.use_checkpoint and layer_index < self.checkpoint_num
-            )
-            x = layer.forward_scan(
-                x,
-                self.fw_update_group_size,
-                use_checkpoint=use_checkpoint,
-            )
+        if self.fw_update_layer_group_size == 1:
+            # Layer-major keeps all independent windows in one batched SDPA.
+            for layer_index, layer in enumerate(self.layers):
+                use_checkpoint = (
+                    self.use_checkpoint and layer_index < self.checkpoint_num
+                )
+                x = layer.forward_scan(
+                    x,
+                    self.fw_update_group_size,
+                    use_checkpoint=use_checkpoint,
+                )
+        else:
+            # Group-major within each layer group allows the independent
+            # fast-weight updates of those layers to share large GEMMs. The
+            # complete multi-layer recurrent scan is one checkpoint boundary.
+            for layer_start, layer_end in self._iter_cross_layer_groups():
+                x = self._forward_layer_group(
+                    x,
+                    layer_start,
+                    layer_end,
+                    use_checkpoint=(
+                        self.use_checkpoint
+                        and layer_end <= self.checkpoint_num
+                    ),
+                )
 
         x = self.norm_f(
             x.to(dtype=self.norm_f.weight.dtype)
