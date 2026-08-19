@@ -524,6 +524,9 @@ def adapt_image_checkpoint_for_video(model, state_dict):
         ):
             del state_dict[head_key]
 
+    if hasattr(model, "add_share_init_weights"):
+        state_dict = model.add_share_init_weights(state_dict)
+
     return state_dict
 
 

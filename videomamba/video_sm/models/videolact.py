@@ -292,30 +292,77 @@ class FastWeightSwiGLU(nn.Module):
         error_heads = error_heads.float()
         d_gate_pre = d_gate_pre.float()
         d_up = d_up.float()
-        w1_grad = torch.einsum(
-            "blhk,blhd->bhkd",
-            hidden * lr1.unsqueeze(2),
-            error_heads,
+        # The three update gradients are independent, identically sized GEMMs
+        # after transposing dW1. Fold the gradient kind into the batch instead
+        # of launching three under-filled GEMMs. This is the within-layer
+        # counterpart of the cross-layer batched-update schedule used by the
+        # recurrent LACT reference.
+        batch_heads = batch_size * self.num_heads
+        gradient_left = torch.stack(
+            (
+                key_heads * lr0.unsqueeze(2),
+                error_heads,
+                key_heads * lr2.unsqueeze(2),
+            )
+        ).permute(0, 1, 3, 4, 2).reshape(
+            3 * batch_heads,
+            self.head_dim,
+            seq_len,
         )
-        w0_grad = torch.einsum(
-            "blhd,blhk->bhdk",
-            key_heads * lr0.unsqueeze(2),
-            d_gate_pre,
+        gradient_right = torch.stack(
+            (
+                d_gate_pre,
+                hidden * lr1.unsqueeze(2),
+                d_up,
+            )
+        ).permute(0, 1, 3, 2, 4).reshape(
+            3 * batch_heads,
+            seq_len,
+            self.hidden_dim,
         )
-        w2_grad = torch.einsum(
-            "blhd,blhk->bhdk",
-            key_heads * lr2.unsqueeze(2),
-            d_up,
-        )
+        w0_grad, w1_grad_transposed, w2_grad = torch.bmm(
+            gradient_left,
+            gradient_right,
+        ).reshape(
+            3,
+            batch_size,
+            self.num_heads,
+            self.head_dim,
+            self.hidden_dim,
+        ).unbind(0)
+        w1_grad = w1_grad_transposed.transpose(-1, -2)
 
-        def muon_update(gradient):
-            flat = gradient.flatten(0, 1)
-            flat = zeropower_via_newtonschulz5(flat, muon_update_steps)
-            return flat.reshape_as(gradient)
-
-        w0_update = muon_update(w0_grad)
-        w1_update = muon_update(w1_grad)
-        w2_update = muon_update(w2_grad)
+        # Muon independently normalizes every matrix in its batch. Orient all
+        # three gradient types alike and process them in one larger batch;
+        # this preserves the per-matrix Newton-Schulz math exactly.
+        transpose_w02 = self.head_dim > self.hidden_dim
+        if transpose_w02:
+            muon_gradients = torch.stack(
+                (
+                    w0_grad.transpose(-1, -2),
+                    w1_grad,
+                    w2_grad.transpose(-1, -2),
+                )
+            )
+        else:
+            muon_gradients = torch.stack(
+                (
+                    w0_grad,
+                    w1_grad.transpose(-1, -2),
+                    w2_grad,
+                )
+            )
+        muon_updates = zeropower_via_newtonschulz5(
+            muon_gradients.flatten(0, 2),
+            muon_update_steps,
+        ).reshape_as(muon_gradients)
+        w0_update, w1_update_oriented, w2_update = muon_updates.unbind(0)
+        if transpose_w02:
+            w0_update = w0_update.transpose(-1, -2)
+            w1_update = w1_update_oriented
+            w2_update = w2_update.transpose(-1, -2)
+        else:
+            w1_update = w1_update_oriented.transpose(-1, -2)
         master_weights = (
             master_w0 + w0_update.to(master_w0.dtype),
             master_w1 + w1_update.to(master_w1.dtype),
@@ -821,6 +868,7 @@ class VisionLACT(nn.Module):
         fw_base_lr=0.01,
         muon_update_steps=5,
         share_proj=False,
+        share_init=False,
         fw_update_group_size=1,
         device=None,
         dtype=None,
@@ -841,11 +889,17 @@ class VisionLACT(nn.Module):
                 "fw_update_group_size must be positive, got "
                 f"{fw_update_group_size}"
             )
+        if share_proj and share_init:
+            raise ValueError(
+                "share_init is only valid for private projections; choose "
+                "either share_proj=True or share_init=True"
+            )
         factory_kwargs = {"device": device, "dtype": dtype}
         self.use_checkpoint = use_checkpoint
         self.checkpoint_num = checkpoint_num
         self.num_classes = num_classes
         self.d_model = self.num_features = self.embed_dim = embed_dim
+        self.share_init = bool(share_init)
 
         self.patch_embed = PatchEmbed(
             img_size=img_size,
@@ -922,6 +976,52 @@ class VisionLACT(nn.Module):
         for layer in self.layers:
             if layer.memory.output_proj is not None:
                 nn.init.zeros_(layer.memory.output_proj.weight)
+        if self.share_init:
+            self.init_memory_projections_from_attention()
+
+    @torch.no_grad()
+    def init_memory_projections_from_attention(self):
+        """Copy Q/K/V weights into independent private memory projections.
+
+        The private projections remain separate trainable parameters. The
+        memory output projection deliberately stays zero-initialized so this
+        initialization preserves the pretrained VideoViT function.
+        """
+        if any(layer.share_proj for layer in self.layers):
+            raise RuntimeError(
+                "Cannot initialize private memory projections when "
+                "share_proj=True"
+            )
+        for layer in self.layers:
+            query_weight, key_weight, value_weight = (
+                layer.mixer.qkv.weight.detach().chunk(3, dim=0)
+            )
+            layer.memory.apply_proj[0].weight.copy_(query_weight)
+            layer.memory.update_proj[0].weight.copy_(key_weight)
+            layer.value_proj.weight.copy_(value_weight)
+
+    def add_share_init_weights(self, state_dict):
+        """Add missing private Q/K/V weights to a pretrained state dict."""
+        if not self.share_init:
+            return state_dict
+        state_dict = state_dict.copy()
+        for layer_index in range(len(self.layers)):
+            qkv_key = f"layers.{layer_index}.mixer.qkv.weight"
+            if qkv_key not in state_dict:
+                continue
+            query_weight, key_weight, value_weight = state_dict[qkv_key].chunk(
+                3,
+                dim=0,
+            )
+            projection_weights = {
+                f"layers.{layer_index}.memory.apply_proj.0.weight": query_weight,
+                f"layers.{layer_index}.memory.update_proj.0.weight": key_weight,
+                f"layers.{layer_index}.value_proj.weight": value_weight,
+            }
+            for key, weight in projection_weights.items():
+                if key not in state_dict:
+                    state_dict[key] = weight.clone()
+        return state_dict
 
     @torch.jit.ignore
     def no_weight_decay(self):

@@ -70,6 +70,15 @@ def get_args():
         '--no_share_proj', dest='share_proj', action='store_false'
     )
     parser.set_defaults(share_proj=False)
+    share_init_group = parser.add_mutually_exclusive_group()
+    share_init_group.add_argument(
+        '--share_init', dest='share_init', action='store_true',
+        help='Initialize private VideoLACT Q/K/V projections from attention',
+    )
+    share_init_group.add_argument(
+        '--no_share_init', dest='share_init', action='store_false'
+    )
+    parser.set_defaults(share_init=False)
 
     parser.add_argument('--disable_eval_during_finetuning', action='store_true', default=False)
     parser.add_argument('--model_ema', action='store_true', default=False)
@@ -411,6 +420,7 @@ def main(args, ds_init):
             fw_update_group_size=args.fw_update_group_size,
             muon_update_steps=args.muon_update_steps,
             share_proj=args.share_proj,
+            share_init=args.share_init,
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )
