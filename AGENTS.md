@@ -71,11 +71,15 @@
   `apply_proj`、`update_proj`、`value_proj` 和 `output_proj`；`share_proj=True`
   作为参数缩减对照，分别复用 attention Q/K/V 与 `mixer.out_proj`。
 - private projection 支持 `share_init=True`（CLI 为 `--share_init`，且不能与
-  `share_proj=True` 同时使用）：加载 image VideoViT checkpoint 时分别以 attention
-  Q/K/V 初始化独立的 `apply_proj/update_proj/value_proj`，之后这些参数不共享并可
-  各自训练。复制必须发生在 image checkpoint 适配阶段，不能只复制模型构造时的
-  随机 Q/K/V。`output_proj` 仍保持零初始化，使新增 memory residual 在 step 0 为零；
+  `share_proj=True` 同时使用）。v3 初始化加载 image VideoViT checkpoint 时分别以
+  attention Q/K/V/O weight 初始化独立的 `apply_proj/update_proj/value_proj/output_proj`，
+  之后这些参数不共享并可各自训练；private memory output 再乘与 shared 模式相同的
+  `dim` 维 `memory_gate`，gate 零初始化，使新增 memory residual 在 step 0 为零。
+  复制必须发生在 image checkpoint 适配阶段，不能只复制模型构造时的随机 Q/K/V/O。
+  `share_init=False` 的默认 private 路径仍沿用零初始化 `output_proj` 且不设 gate。
   已有 VideoLACT checkpoint 若包含 private projection，则不得被 `share_init` 覆盖。
+  2026-08-20 之前的 v2 `share_init` checkpoint 没有 private `memory_gate`，且
+  `output_proj` 从零开始训练；未经显式 state migration 不得直接按 v3 语义恢复。
 - fast weight 是多头 SwiGLU FFN 的 `w0/w1/w2`。默认 `fw_inter_multi=2`、
   `fw_num_heads=1`、`fw_base_lr=0.01`。
 - 每个 FW group 更新分别计算 `w0/w1/w2` 梯度，默认对每组梯度执行 5 次 Muon quintic
@@ -317,13 +321,29 @@
   旧名字后追加 v2；名字虽保留 `shared-proj` 历史字段，实际参数明确为
   `share_proj=False, share_init=True, fw_update_layer_group_size=4`。公网 W&B run 为
   `https://wandb.ai/LVSM-Experiment/videosft/runs/x4rbquus`；于 2026-08-19 启动，
-  training/guard tmux session 分别与 run name 相同及追加 `-guard`，launcher PID
-  为 `2639832`。guard 每 5 秒检查 8 张 GPU，只保留 launcher 后代，启动初期已终止
-  多个外来 GPU 任务。首次 compiled step 约 55.7 秒必须从 ETA 排除；step 80--113
-  稳态约 `1.76--1.78 s/step`，日志 PyTorch peak `28,736 MiB`、`nvidia-smi` 每卡约
-  `35.0 GiB`，grad norm 约 4.17。纯训练每 epoch 预计约 3 小时 42 分，含 single-view
-  validation/checkpoint 约 3 小时 45--50 分；10 epochs 加最终 12-view test 的完整
-  ETA 约 38--40 小时（假设 guard 持续阻止 GPU 抢占）。
+  launcher PID 为 `2639832`。guard 每 5 秒检查 8 张 GPU，只保留 launcher 后代，
+  启动初期已终止多个外来 GPU 任务。首次 compiled step 约 55.7 秒必须从 ETA 排除；
+  稳态约 `1.76--1.78 s/step`，日志 PyTorch peak `28,777 MiB`、`nvidia-smi` 每卡约
+  `35.0 GiB`。该版本只复制 Q/K/V，private `output_proj` 零初始化且没有 memory gate；
+  epoch 0--4 validation top-1 依次为 36.8/56.5/63.0/67.3/69.6%，从 epoch 1 起比
+  shared-proj G1 同 epoch 低约 2.5--2.8 个点，epoch 1--4 平均 grad norm 约
+  12.9--13.8（shared 约 6.0--6.8）。2026-08-20 按用户要求于 epoch 5 step
+  3832/7513 用 SIGINT 关闭，以切换到 Q/K/V/O + zero-gate v3；training/guard tmux
+  session、launcher 和 8 个 rank 均已退出，8 张卡已释放，不得自动恢复该 v2 run。
+- private-proj + Q/K/V/O share-init + zero memory gate + strict cross-layer G4 的 F64
+  v3 脚本为
+  `videomamba/video_sm/exp/k400/videolact_middle/run_f64x224_no_ld_v3.sh`，run name 为
+  `video-lact-middle-k400-f64x224-no-ld-10ep-private-qkvo-gate-v3`；除上述 v3 初始化
+  语义外，模型、数据、optimizer、schedule、checkpoint 和 G4 参数均与 v2 相同，且从
+  ImageNet checkpoint 全新启动，不 resume v2。公网 W&B run 为
+  `https://wandb.ai/LVSM-Experiment/videosft/runs/m9tdu0ga`；2026-08-20 启动时
+  launcher/guard PID 为 `203776`/`203794`，两个 tmux session 分别为 run name 及
+  追加 `-guard`。正式 checkpoint 日志确认 32 层 private Q/K/V/O 均不在 missing
+  keys 中，只有新 gate、fast weight、memory norm 和 lr projection 等 LACT-only
+  参数保持新初始化。首个 compiled step 约 41.9 秒；step 20--29 稳态约
+  `1.76--1.77 s/step`，step 80--105 的日志 time 中位数为 `1.798 s`（范围
+  1.772--1.804 秒）；PyTorch peak `28,745 MiB`、`nvidia-smi` 每卡约 `35.0 GiB`，
+  该窗口 grad norm 中位数约 3.18。GPU watchdog 每 5 秒清除非 launcher 后代。
 
 ## Weights & Biases 规则
 
@@ -360,10 +380,12 @@
 - VideoLACT：默认 private projection 路径及 shared projection 对照路径均已验证；
   shared 模式下 Q/K/V 分别进入 FW apply/update/target，memory output 复用
   attention out projection。
-- VideoLACT：`share_init` 已用真实 ImageNet VideoViT-Middle checkpoint 验证
-  Q/K/V 到 private apply/update/value projection 的逐值映射、参数不共享、
-  `output_proj` 保持全零，以及与 `share_proj` 的互斥检查；构造阶段和 checkpoint
-  适配阶段均保持 step-0 VideoViT 函数不变。
+- VideoLACT：v3 `share_init` 已用真实 ImageNet VideoViT-Middle checkpoint 验证
+  attention Q/K/V/O weight 到 private apply/update/value/output projection 的逐值
+  映射、参数不共享、`memory_gate` 全零，以及已有 private tensor 不被 checkpoint
+  适配覆盖。小模型进一步验证任意改变 private memory-only 参数都不改变 step-0
+  输出，初始反向只有 gate 接收 memory residual 梯度、gate 后方 projection 梯度为零；
+  修改后的 private G1/G4 CPU FP32 输出最大差为 0、输入梯度最大差约 `1.34e-9`。
 - VideoLACT：合批 `dW0/dW1/dW2` GEMM 与合批 Muon 已对 1/3 FW head、intermediate
   dimension 大于/小于 head dimension 的情况和旧公式比较；fast/master weight
   输出最大差为 0。两层完整 recurrent scan 输出最大差为 0，输入梯度最大差约

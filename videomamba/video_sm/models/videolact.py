@@ -413,6 +413,7 @@ class LACTBlock(nn.Module):
         fw_base_lr=0.01,
         muon_update_steps=5,
         share_proj=False,
+        gate_memory_output=False,
         norm_epsilon=1e-5,
         device=None,
         dtype=None,
@@ -457,11 +458,12 @@ class LACTBlock(nn.Module):
             else nn.Linear(dim, dim, bias=False, **factory_kwargs)
         )
         # Shared projection mode cannot zero mixer.out_proj without also
-        # disabling the pretrained attention branch. A zero-initialized
-        # channel gate keeps only the newly added memory residual at zero.
+        # disabling the pretrained attention branch. Private share-init uses
+        # the same zero-gate mechanism after copying attention out_proj, so
+        # both variants preserve the pretrained function at step 0.
         self.memory_gate = (
             nn.Parameter(torch.zeros(dim, **factory_kwargs))
-            if share_proj
+            if share_proj or gate_memory_output
             else None
         )
         self.lr_proj = nn.Linear(dim, 3, bias=False, **factory_kwargs)
@@ -591,10 +593,11 @@ class LACTBlock(nn.Module):
             memory_output = self.mixer.proj_drop(
                 self.mixer.out_proj(memory_output)
             )
-            memory_output = memory_output * self.memory_gate
         else:
             key = target = memory_input
             memory_output = self.memory(memory_input, (w0, w1, w2))
+        if self.memory_gate is not None:
+            memory_output = memory_output * self.memory_gate
         memory_output = memory_output.reshape(
             batch_size * group_size,
             seq_len,
@@ -1043,6 +1046,7 @@ class VisionLACT(nn.Module):
                     fw_base_lr=fw_base_lr,
                     muon_update_steps=muon_update_steps,
                     share_proj=share_proj,
+                    gate_memory_output=self.share_init,
                     norm_epsilon=norm_epsilon,
                     **factory_kwargs,
                 )
@@ -1060,22 +1064,23 @@ class VisionLACT(nn.Module):
                 **(initializer_cfg if initializer_cfg is not None else {}),
             )
         )
-        # Keep the newly added private memory branch function-preserving when
-        # the shared trunk is initialized from an image VideoViT checkpoint.
-        # Shared mode achieves the same behavior through its memory-only gate.
+        # Default private projections keep the historical zero-output init.
+        # Private share-init instead copies attention Q/K/V/O and uses the
+        # same zero memory gate as shared mode to preserve the pretrained
+        # VideoViT function at step 0.
         for layer in self.layers:
-            if layer.memory.output_proj is not None:
+            if layer.memory.output_proj is not None and not self.share_init:
                 nn.init.zeros_(layer.memory.output_proj.weight)
         if self.share_init:
             self.init_memory_projections_from_attention()
 
     @torch.no_grad()
     def init_memory_projections_from_attention(self):
-        """Copy Q/K/V weights into independent private memory projections.
+        """Copy Q/K/V/O weights into independent private memory projections.
 
         The private projections remain separate trainable parameters. The
-        memory output projection deliberately stays zero-initialized so this
-        initialization preserves the pretrained VideoViT function.
+        zero-initialized memory-only gate preserves the pretrained VideoViT
+        function without discarding the copied output projection.
         """
         if any(layer.share_proj for layer in self.layers):
             raise RuntimeError(
@@ -1089,9 +1094,12 @@ class VisionLACT(nn.Module):
             layer.memory.apply_proj[0].weight.copy_(query_weight)
             layer.memory.update_proj[0].weight.copy_(key_weight)
             layer.value_proj.weight.copy_(value_weight)
+            layer.memory.output_proj.weight.copy_(
+                layer.mixer.out_proj.weight.detach()
+            )
 
     def add_share_init_weights(self, state_dict):
-        """Add missing private Q/K/V weights to a pretrained state dict."""
+        """Add missing private Q/K/V/O weights to a pretrained state dict."""
         if not self.share_init:
             return state_dict
         state_dict = state_dict.copy()
@@ -1108,6 +1116,11 @@ class VisionLACT(nn.Module):
                 f"layers.{layer_index}.memory.update_proj.0.weight": key_weight,
                 f"layers.{layer_index}.value_proj.weight": value_weight,
             }
+            output_key = f"layers.{layer_index}.mixer.out_proj.weight"
+            if output_key in state_dict:
+                projection_weights[
+                    f"layers.{layer_index}.memory.output_proj.weight"
+                ] = state_dict[output_key]
             for key, weight in projection_weights.items():
                 if key not in state_dict:
                     state_dict[key] = weight.clone()
