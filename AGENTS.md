@@ -410,6 +410,19 @@
   VideoMARS；epoch 0--7 validation top-1 为 34.38/58.63/65.69/69.96/72.15/
   73.94/75.07/75.81%，latest/best checkpoint 均保留。training/guard tmux、launcher、
   8 个 rank 和 guard 均已退出，8 张 GPU 回到约 4 MiB/0%，不得自动恢复该 run。
+- shared-pixel-MAE VideoMARS-Middle 的首个 K400 F64 run 脚本为
+  `videomamba/video_sm/exp/k400/videomars_middle/run_f64x224_no_ld_v1.sh`，run name 为
+  `video-mars-middle-k400-f64x224-no-ld-v1`。它沿用 LACT F64/no-LD recipe 的 64 帧、
+  每卡 batch 4、`num_sample=2`、10 epochs、1 epoch warmup、base LR `2e-4`、drop path
+  0.8、layer decay 1.0 和 32 层主干 checkpoint；MARS 显式固定 G8、288×2/1-head
+  shared encoder 与 64×1/1-head decoder。正式 ImageViT best checkpoint 初始化日志
+  确认 32 层 trunk 全部加载，missing 仅时间位置编码、400 类 head 和
+  `shared_state.*`，没有 unexpected key。公网 W&B run 为
+  `https://wandb.ai/LVSM-Experiment/videosft/runs/qf550x4q`；2026-08-22 启动，tmux
+  session/launcher PID 为 run name/`1328001`，PID 与日志分别在 run 根目录的
+  `train.pid`/`train.log`。step 25--49 稳态约 `1.03--1.09 s/step`，PyTorch peak
+  `28,945 MiB`、`nvidia-smi` 每卡约 `34,487 MiB`，grad norm 主要约 3.15--3.20，
+  loss scale 65,536 且没有 OOM/NaN；按稳态纯训练步粗算每 epoch 约 2.2 小时。
 
 ## Weights & Biases 规则
 
