@@ -39,7 +39,7 @@ def get_args():
         '--tubelet_size',
         type=int,
         default=None,
-        help='Tubelet size (default: 1 for VideoLACT, 2 otherwise)',
+        help='Tubelet size (default: 1 for VideoLACT/VideoMARS, 2 otherwise)',
     )
     parser.add_argument('--orig_t_size', type=int, default=8)
     parser.add_argument('--input_size', default=224, type=int,
@@ -73,6 +73,10 @@ def get_args():
         ),
     )
     parser.add_argument('--muon_update_steps', type=int, default=5)
+    parser.add_argument('--mars_mask_ratio', type=float, default=0.5)
+    parser.add_argument('--mars_decoder_dim', type=int, default=64)
+    parser.add_argument('--mars_decoder_num_heads', type=int, default=1)
+    parser.add_argument('--mars_decoder_mlp_ratio', type=float, default=2.0)
     share_proj_group = parser.add_mutually_exclusive_group()
     share_proj_group.add_argument(
         '--share_proj', dest='share_proj', action='store_true'
@@ -274,7 +278,11 @@ def get_args():
 
     args = parser.parse_args()
     if args.tubelet_size is None:
-        args.tubelet_size = 1 if 'videolact' in args.model else 2
+        args.tubelet_size = (
+            1
+            if any(name in args.model for name in ('videolact', 'videomars'))
+            else 2
+        )
     if args.wandb and not args.wandb_run_name:
         parser.error('--wandb_run_name is required when --wandb is set')
     return args, ds_init
@@ -444,6 +452,30 @@ def main(args, ds_init):
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )
+    elif 'videomars' in args.model:
+        model = create_model(
+            args.model,
+            img_size=args.input_size,
+            pretrained=False,
+            num_classes=args.nb_classes,
+            fc_drop_rate=args.fc_drop_rate,
+            drop_rate=args.drop,
+            attn_drop_rate=args.attn_drop_rate,
+            drop_path_rate=args.drop_path,
+            mlp_ratio=args.mlp_ratio,
+            kernel_size=args.tubelet_size,
+            num_frames=args.num_frames,
+            fw_inter_multi=args.fw_inter_multi,
+            fw_num_heads=args.fw_num_heads,
+            fw_update_group_size=args.fw_update_group_size,
+            muon_update_steps=args.muon_update_steps,
+            mars_mask_ratio=args.mars_mask_ratio,
+            mars_decoder_dim=args.mars_decoder_dim,
+            mars_decoder_num_heads=args.mars_decoder_num_heads,
+            mars_decoder_mlp_ratio=args.mars_decoder_mlp_ratio,
+            use_checkpoint=args.use_checkpoint,
+            checkpoint_num=args.checkpoint_num,
+        )
     else:
         model = create_model(
             args.model,
@@ -520,7 +552,10 @@ def main(args, ds_init):
         )
 
         # interpolate position embedding
-        if any(name in args.model for name in ('deit', 'videomamba', 'videovit', 'videolact')):
+        if any(
+            name in args.model
+            for name in ('deit', 'videomamba', 'videovit', 'videolact', 'videomars')
+        ):
             pos_embed_checkpoint = checkpoint_model['pos_embed']
             embedding_size = pos_embed_checkpoint.shape[-1] # channel dim
             num_patches = model.patch_embed.num_patches # 

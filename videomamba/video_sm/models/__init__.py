@@ -25,6 +25,11 @@ from .videolact import (
     videolact_small,
     videolact_middle,
 )
+from .videomars import (
+    videomars_tiny,
+    videomars_small,
+    videomars_middle,
+)
 
 try:
     from .videomamba import (

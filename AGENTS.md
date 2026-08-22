@@ -2,7 +2,8 @@
 
 ## 总体目标
 
-- 本仓库用于比较 VideoMamba、VideoViT 和 VideoLACT 在图像预训练、视频监督训练下的架构能力。
+- 本仓库用于比较 VideoMamba、VideoViT、VideoLACT 和 VideoMARS 在图像预训练、
+  视频监督训练下的架构能力。
 - 新架构必须作为独立模型实现。不要在 VideoMamba 或 VideoViT 中加入切换 mixer 的模式开关。
 - 默认不推送；只有用户在当前任务明确要求时才允许 push。
 
@@ -19,8 +20,8 @@
   tubelet embedding 与时间位置编码。
 - tiny/small/middle/base 分别使用 3/6/9/12 个 attention head。tiny/small/base 的
   head dim 为 64；middle 使用规整的 `dim=432`、`depth=32`，head dim 为 48，
-  Image/Video ViT 参数量约 78.6M。Image VideoViT、VideoViT 和 VideoLACT 的
-  middle 配置必须同步，保证 image checkpoint 的共享参数形状兼容。
+  Image/Video ViT 参数量约 78.6M。Image VideoViT、VideoViT、VideoLACT 和
+  VideoMARS 的 middle 配置必须同步，保证 image checkpoint 的共享参数形状兼容。
 
 ## VideoLACT
 
@@ -104,6 +105,53 @@
   避免不同层的 Python `drop_prob` 导致 Dynamo 重编译，也避免 `model.to(bfloat16)`
   量化概率。共享 QKV 的 value 必须 contiguous，避免各层 stride guard 重编译。
 
+## VideoMARS
+
+- MARS 表示 Masked Autoencoding Recurrent State。它是独立视频架构，实现位于
+  `videomamba/video_sm/models/videomars.py`，注册名为 `videomars_tiny`、
+  `videomars_small`、`videomars_middle`；不得作为 VideoViT/VideoLACT 的 mixer
+  开关实现。
+- block 仍按 `window softmax attention -> recurrent state memory -> slow SwiGLU
+  MLP` 做 sequential residual。window attention、slow MLP 以及相应 norm 的参数名、
+  形状和执行位置与 VideoViT/VideoLACT 相同，使 image VideoViT trunk 可以初始化
+  MARS；MARS 不使用 LACT 的 apply/update/value projection 或 Q/K/V regression
+  target。
+- 每个 tubelet 仍为 `1 CLS + N spatial patches`，复用空间位置编码并叠加时间位置
+  编码。`window_size == chunk_size == (N + 1) * fw_update_group_size`，分类/回归
+  CLI 未显式设置 tubelet size 时默认用 1。分类读取最后一个 tubelet 的 CLS。
+- recurrent state 是与 LACT 同尺寸的多头 SwiGLU `w0/w1/w2` encoder，默认
+  `fw_inter_multi=2`、`fw_num_heads=1`。每个 chunk 先用旧 state 对全部 token
+  apply；仅当存在后继 chunk 时，才对当前 chunk 做 masked hidden-state
+  reconstruction 并更新 state，因此严格保持 apply-then-update，最后一个无后继
+  state 的 update 必须跳过。
+- inner objective 只随机 mask patch token，永不 mask 每个 tubelet 的 CLS；默认
+  mask ratio 为 0.5。target 是当前 `memory_norm` 后 hidden state 的直接
+  stop-gradient 副本，不使用 EMA teacher、RePA target encoder 或 target projection。
+  训练态每个 sample 随机精确选择 mask 数量；评估态使用由 layer/chunk index 决定的
+  deterministic mask，不能消耗 evaluation RNG。
+- masked visible token 先经过当前 fast SwiGLU state，再进入每层独立的 tiny MAE
+  decoder。默认 decoder 只有 64 hidden dim、1 head、1 个 attention block 和
+  ratio-2 MLP；固定 1D sin-cos position embedding 不持久化。decoder attention
+  必须使用支持二阶梯度的显式 softmax 实现，因为 outer supervised loss 需要穿过
+  inner reconstruction-gradient update，而当前 PyTorch fused SDPA backward 不支持
+  该路径所需的 double backward。
+- reconstruction loss 对 `w0/w1/w2` 的梯度按 LACT 相同的矩阵朝向合批，并默认做
+  5 次 quintic Newton-Schulz zeroth-power；由于这是标准 loss gradient，master
+  weight 沿负 Muon/NS 方向更新。master state 保持 FP32，新 fast state 沿 LACT
+  相同维度归一化，并在 CUDA 上转为 BF16。
+- memory residual 乘独立的 per-channel `memory_gate`，gate 零初始化，使新增 MARS
+  分支在 image checkpoint 初始化时不扰动 window-attention/slow-MLP 主干。初始 step
+  只有 gate 先收到 outer gradient；gate 打开后，future chunk 对更新后 state 的消费
+  才为 fast encoder 和 decoder 提供 meta-gradient。
+- activation checkpoint 必须覆盖一层的完整 recurrent scan并保留 RNG state，不能
+  切断需要被后继 chunk 消费的 state history。首版只实现 layer-major G1 调度；
+  `fw_update_group_size` 是 temporal tubelet grouping，不是 LACT 的 cross-layer
+  update batching。
+- Middle 默认 `dim=432`、depth 32、9 window-attention heads；64 帧/G8/400 类时
+  总参数 117,051,408，其中 fast state 35,831,808、32 个 tiny decoder 合计
+  2,854,400。总量比 shared-proj VideoLACT-Middle 的 114,460,264 多约 2.3%，
+  明显小于 private-proj VideoLACT-Middle 的 138,348,136。
+
 ## LACT 参考实现与 chunk/update 结论
 
 - LVSM block 是严格 sequential residual：window attention -> fast-weight memory ->
@@ -169,17 +217,19 @@
 
 ## Image ViT 初始化视频模型
 
-- `video_sm/utils.py::adapt_image_checkpoint_for_video` 同时服务 VideoViT 和
-  VideoLACT：把 2D patch kernel 中心膨胀为 3D tubelet kernel，并跳过形状
-  不匹配的分类头。
+- `video_sm/utils.py::adapt_image_checkpoint_for_video` 同时服务 VideoViT、
+  VideoLACT 和 VideoMARS：把 2D patch kernel 中心膨胀为 3D tubelet kernel，
+  并跳过形状不匹配的分类头。
 - image checkpoint 没有 `temporal_pos_embedding` 时保持视频模型的零初始化；
   如果 checkpoint 中存在时间位置编码，则按目标帧数做线性插值。
 - VideoLACT 从 image VideoViT 加载 patch embedding、`cls_token`、空间
   `pos_embed`、每层 window attention/norm、slow MLP、最终 norm 和形状兼容的
   head。LACT 独有的 memory、fast weight、`lr_proj` 以及 private 模式下的新增
   projection 保持新初始化。
-- 分类与回归入口都必须让 `videolact_*` 使用独立空间/时间位置编码的 checkpoint
-  插值分支，不能误走标准 VideoMAE 的联合位置编码分支。
+- VideoMARS 加载相同的共享 trunk；`memory_norm`、fast-state encoder、tiny decoder、
+  `memory_gate` 和时间位置编码保持 MARS 初始化，其中 gate 必须保持全零。
+- 分类与回归入口都必须让 `videolact_*` 和 `videomars_*` 使用独立空间/时间位置编码的
+  checkpoint 插值分支，不能误走标准 VideoMAE 的联合位置编码分支。
 
 ## 环境与兼容性
 
@@ -187,7 +237,7 @@
   `videomamba/environment-videovit.yml`。
 - 核心版本为 Python 3.11、PyTorch 2.13.0 + CUDA 13.0、torchvision
   0.28.0、timm 1.0.28、NumPy 2.4.6。
-- VideoViT/VideoLACT 的图像分类、视频分类和回归路径不依赖 Mamba CUDA
+- VideoViT/VideoLACT/VideoMARS 的图像分类、视频分类和回归路径不依赖 Mamba CUDA
   extension、Apex、DeepSpeed、TensorFlow 或 xFormers。
 - 两个模型包把 `mamba_ssm` 视为可选依赖，但任何与 `mamba_ssm` 无关的导入
   错误必须继续抛出。
@@ -405,8 +455,22 @@
 - VideoLACT：GPU FP32、H100 BF16、apply/update gradient checkpoint 反向均
   通过；默认 5 次 NS 的 `videolact_tiny` 已完成 `1x3x8x224x224 -> 400`
   真实尺寸推理。
-- Image ViT 初始化：VideoViT 和 VideoLACT 都已验证 2D patch kernel 中心膨胀、
-  window QKV 逐值加载、类别头跳过以及 LACT-only 参数保持新初始化。
+- VideoMARS：tiny synthetic model 已验证 CPU FP32 前后向、training random mask、
+  evaluation deterministic mask、`torch.no_grad()` 内的 state update，以及 G2
+  apply-then-update。零 gate 时只有 gate 接收 memory residual 梯度；显式打开 gate
+  后每层 `w0/w1/w2` 和 tiny decoder 都获得非零 meta-gradient。完整 layer-scan
+  checkpoint 与 eager 在 random mask、attention dropout 和 drop-path 同时开启且
+  使用相同 seed 时，输出、输入梯度和全部参数梯度均逐值一致；CPU BF16 autocast
+  下的 eager/checkpoint outer backward 也都产生 finite fast-state/decoder gradient。
+- VideoMARS：inner update 前后用完全相同的 hidden chunk 和 deterministic mask 测得
+  reconstruction loss 从 `[1.00708, 1.00277]` 降为 `[1.00706, 1.00273]`，确认标准
+  loss gradient 取负后再做 NS 的更新方向正确；mask index 检查确认所有 per-tubelet
+  CLS 都保留为 visible token，且只有一个 group 时 decoder 不参与计算，确认最后一次
+  无效 update 已跳过。只修改早期 group、保持最后 group 输入不变时，最后 group 输出
+  最大变化约 0.085，确认 state 正在跨 group 传递信息。
+- Image ViT 初始化：VideoViT、VideoLACT 和 VideoMARS 都已验证 2D patch kernel
+  中心膨胀、window QKV/slow MLP 逐值加载及类别头跳过；LACT/MARS-only 参数保持
+  新初始化，MARS gate 保持全零。VideoMARS registry 构造和 Middle 参数量也已验证。
 - VideoLACT：默认 CUDA compiled 和 compiled+checkpoint 路径均已在 H100 BF16
   验证，并确认生成 fused RMSNorm、SwiGLU/softplus backward、Muon bmm+norm 等
   Triton kernel；整层 recurrent-scan checkpoint 已在 CPU private/shared 模式以及
