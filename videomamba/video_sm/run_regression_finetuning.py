@@ -72,20 +72,29 @@ def get_args():
     )
     parser.add_argument('--muon_update_steps', type=int, default=5)
     parser.add_argument('--mars_mask_ratio', type=float, default=0.5)
-    parser.add_argument('--mars_encoder_dim', type=int, default=None)
-    parser.add_argument('--mars_encoder_depth', type=int, default=2)
-    parser.add_argument('--mars_encoder_num_heads', type=int, default=None)
-    parser.add_argument('--mars_decoder_dim', type=int, default=64)
-    parser.add_argument('--mars_decoder_depth', type=int, default=1)
-    parser.add_argument('--mars_decoder_num_heads', type=int, default=1)
-    parser.add_argument('--mars_decoder_mlp_ratio', type=float, default=2.0)
+    # Deprecated pre-redesign MARS options; accepted only for parse compatibility.
+    parser.add_argument('--mars_encoder_dim', type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--mars_encoder_depth', type=int, default=2,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--mars_encoder_num_heads', type=int, default=None,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--mars_decoder_dim', type=int, default=64,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--mars_decoder_depth', type=int, default=1,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--mars_decoder_num_heads', type=int, default=1,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--mars_decoder_mlp_ratio', type=float, default=2.0,
+                        help=argparse.SUPPRESS)
     parser.add_argument(
         '--mars_muon_backward',
         choices=('exact', 'straight_through', 'normalized_straight_through'),
         default='normalized_straight_through',
-        help='Backward Jacobian for the MARS Muon/NS transform',
+        help=argparse.SUPPRESS,
     )
-    parser.add_argument('--mars_muon_backward_gain', type=float, default=2.0)
+    parser.add_argument('--mars_muon_backward_gain', type=float, default=2.0,
+                        help=argparse.SUPPRESS)
     share_proj_group = parser.add_mutually_exclusive_group()
     share_proj_group.add_argument(
         '--share_proj', dest='share_proj', action='store_true'
@@ -467,18 +476,11 @@ def main(args, ds_init):
             kernel_size=args.tubelet_size,
             num_frames=args.num_frames,
             fw_inter_multi=args.fw_inter_multi,
+            fw_num_heads=args.fw_num_heads,
+            fw_base_lr=args.fw_base_lr,
             fw_update_group_size=args.fw_update_group_size,
             muon_update_steps=args.muon_update_steps,
             mars_mask_ratio=args.mars_mask_ratio,
-            mars_encoder_dim=args.mars_encoder_dim,
-            mars_encoder_depth=args.mars_encoder_depth,
-            mars_encoder_num_heads=args.mars_encoder_num_heads,
-            mars_decoder_dim=args.mars_decoder_dim,
-            mars_decoder_depth=args.mars_decoder_depth,
-            mars_decoder_num_heads=args.mars_decoder_num_heads,
-            mars_decoder_mlp_ratio=args.mars_decoder_mlp_ratio,
-            mars_muon_backward=args.mars_muon_backward,
-            mars_muon_backward_gain=args.mars_muon_backward_gain,
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )

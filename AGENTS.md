@@ -111,66 +111,50 @@
   `videomamba/video_sm/models/videomars.py`，注册名为 `videomars_tiny`、
   `videomars_small`、`videomars_middle`；不得作为 VideoViT/VideoLACT 的 mixer
   开关实现。
-- 主干是纯 window VideoViT：所有 32 个 Middle block 只执行 grouped window softmax
-  attention 和 slow SwiGLU MLP，不再在每个 block 内放 recurrent memory。window
-  attention、slow MLP 及相应 norm 的参数名和形状与 VideoViT/VideoLACT 相同，使
-  image VideoViT trunk 可以逐层初始化 MARS；MARS 不使用 LACT 的 Q/K/V regression
-  target，也不再重建任何中间 hidden state。
+- VideoMARS 已从旧的 model-wide shared pixel-MAE/fast-Transformer 原型重构为逐层
+  recurrent 架构。每层顺序与 VideoLACT 相同：grouped window softmax attention ->
+  masked-reconstruction fast-weight memory -> slow SwiGLU MLP。window attention、slow
+  MLP 及相应 norm 的参数名、形状和执行位置继续与 VideoViT/VideoLACT 相同，使 image
+  VideoViT trunk 可以逐层初始化 MARS。
 - 每个 tubelet 仍为 `1 CLS + N spatial patches`，复用空间位置编码并叠加时间位置
   编码。`window_size == chunk_size == (N + 1) * fw_update_group_size`，分类/回归
   CLI 未显式设置 tubelet size 时默认用 1。分类读取最后一个 tubelet 的 CLS。
-- 整个模型只维护一个 per-sample shared fast Transformer state，位于根模块
-  `shared_state`，不随 32 个主干 block 复制。encoder 含 fast
-  `input_proj/output_proj`，每层含显式 self-attention `wq/wk/wv/wo` 和 fast SwiGLU
-  `w0/w1/w2`；RMSNorm 无 affine，不属于 fast state。默认 encoder dim 是主干 dim 的
-  `2/3`、depth 2、1 head，Middle 即 288 dim；fast SwiGLU `fw_inter_multi=2`。
-  这些大小仍可由 CLI 配置。
-- shared state 使用 update-then-apply：每个 temporal group 先从 masked-pixel MAE loss
-  更新 state，再用更新后的 encoder 编码该 group 的完整 token。因此最后一个 group
-  的 update 也会被当前 group 消费；F64/G8 总共只做 8 次 model-wide update，而被
-  删除的 per-layer 原型是 `32 × 7 = 224` 次 update。
-- inner objective 只随机 mask patch token，永不 mask 每个 tubelet 的 CLS；默认
-  mask ratio 为 0.5。encoder 的 inner pass 只看到 visible input-embedding token；
-  tiny decoder 用 mask token 补回完整序列并重建输入视频的 raw patch pixels。target
-  是进入模型的增强/归一化后 tensor 的 stop-gradient patchify 结果；tubelet size 为
-  `k` 时 prediction dim 是 `3 * k * 16 * 16`。不使用 EMA teacher、RePA target
-  encoder 或 hidden-state target。训练态每个 sample 随机精确选择 mask 数量；评估态
-  使用只由 group index 决定的 deterministic mask，不消耗 evaluation RNG。
-- masked visible token 经过当前 fast Transformer encoder 后进入 tiny Transformer
-  decoder；全模型只共享这一个 decoder。decoder 的默认配置为
-  64 dim、1 layer、1 head、ratio-2 MLP，固定 1D sin-cos position embedding 不持久化。
-  fast encoder 与 decoder 的 inner attention 都使用支持二阶梯度的显式 softmax；
-  主干 window attention 继续使用高效 SDPA。
-- reconstruction loss 只用于 `torch.autograd.grad(loss, fast_weights)` 生成当前
-  sample 的 fast-state update，绝不能被返回给 engine、加到分类/回归 loss 或作为
-  AdamW auxiliary loss。persistent state initializer 和 decoder 只通过当前/后续
-  group 消费更新后 state 所产生的 supervised meta-gradient 训练；outer loss 仍穿过
-  raw inner gradient，因此明确保留对 encoder/decoder 的二阶训练信号。
-- reconstruction loss 对全部 fast input/output、Q/K/V/O 和 SwiGLU 矩阵求梯度；
-  将方向统一后按矩阵 shape 合批，并默认做 5 次 quintic Newton-Schulz zeroth-power。
-  由于这是标准 loss gradient，master weight 沿负 Muon/NS 方向更新。master state
-  保持 FP32，新 fast matrix 沿输入维归一化，并在 CUDA 上转为 BF16。MARS matrix
-  布局为 `[B,input,output]`，初始化和每次 update 后都必须沿 `dim=1` 归一化；不能
-  误用 LACT `[B,H,input,output]` 布局对应的 `dim=2`。
-- Muon/NS 的前向 update 始终严格执行相同的 5-step quintic 数学；默认 outer backward
-  使用 `normalized_straight_through` surrogate：对每个矩阵用
-  `2 / (||inner_grad|| + 1e-7)` 乘 identity Jacobian，保留 inner-gradient Hessian，
-  但不反传病态的 quintic NS Jacobian。CLI 为 `--mars_muon_backward` 和
-  `--mars_muon_backward_gain`，仍保留 `exact` 与无归一化 `straight_through` 对照；
-  默认 gain 2 是 F64/G8 500-step K400 诊断后选定，不能无验证随意增大。
-- 所有 group 的 shared-encoder 输出拼回完整视频，并在第 32 个 window-ViT block
-  之后、最终 `norm_f` 之前通过一个共享 per-channel `memory_gate` 加到主干；gate
-  零初始化，使 image checkpoint 初始化时模型函数严格保持 window-ViT baseline。
-  初始 step 只有 gate 先收到 outer gradient，gate 打开后 shared encoder/decoder 才
-  得到 supervised meta-gradient。
-- `use_checkpoint/checkpoint_num` 现在只 checkpoint 普通 window-ViT 主干 block；
-  shared recurrent scan 在这些 checkpoint 外只执行一次，避免旧 per-layer 原型把
-  nested `autograd.grad` 包进整层 checkpoint 所导致的即时重算与 OOM。
-- Middle 默认 `dim=432`、depth 32、9 window-attention heads；64 帧/G8/400 类时
-  总参数 80,357,168；唯一 shared state 合计 2,019,616，其中 fast Transformer
-  1,907,712、pixel decoder 111,040、memory norm/gate 864。该规模按 H100 B8
-  显存与 private VideoLACT 对齐后选定；32 个主干 block 中仍不存在 `state_encoder`
-  或 decoder。
+- 每层维护独立的 per-sample fast state，不跨层共享。state 是一个与 LACT 完全同形的
+  multi-head SwiGLU：`w0/w2` 把 hidden token 编码为 gated latent，`w1` 把 latent
+  解码回模型宽度，因此它同时是轻量 encoder/decoder；不再包含 Transformer、Q/K/V、
+  attention、独立 input/output projection 或 persistent tiny decoder。默认
+  `fw_inter_multi=2`、`fw_num_heads=1`、`fw_base_lr=0.01`。
+- inner objective 是 masked hidden-state reconstruction。window attention 后的归一化
+  hidden state 是 stop-gradient target；对每个 sample/chunk 随机精确 mask 默认 50%
+  hidden channels，并在整个 chunk 的 token 上复用该 channel mask。masked input 将这些
+  channel 清零，state decoder 只在被 mask 的坐标上重建原 hidden。采用 feature mask
+  而非整 token mask，是因为没有 token-mixing Transformer 的 SwiGLU 必须从同一 token
+  的可见 feature 恢复缺失 feature；评估态 mask 只由 layer/group index 决定且不消耗 RNG。
+- update 数学除 reconstruction mask 外逐项复用 LACT：误差为
+  `(target - reconstruction) * mask / seq_len`，显式计算 `w0/w1/w2` 的解析负梯度，
+  三种 per-token LR 来自 `softplus(lr_proj(hidden) + inverse_softplus(0.01))`，再做默认
+  5 次 quintic Newton-Schulz zeroth-power，方向加到 FP32 master weights。新 fast
+  weights 沿 LACT `[B,H,input,output]` 布局的 input dim `dim=2` 归一化，CUDA 上转 BF16。
+- MARS 不再使用 `torch.autograd.grad(create_graph=True)`，也不再使用 Muon straight-
+  through surrogate。解析 inner gradient、exact NS、master update 和归一化都是普通
+  differentiable tensor 运算，因此 outer classification/regression loss 会像 LACT 一样
+  得到完整 exact meta-gradient。旧 `mars_encoder_*`、`mars_decoder_*`、
+  `mars_muon_backward*` CLI 仅为 archived 脚本兼容而接受，当前模型会忽略它们。
+- 调度严格为 apply-then-update：一个 group 用旧 state 完成 memory residual 和 slow MLP，
+  当前 masked reconstruction update 只能供后续 group 使用；最后一个无消费者的 update
+  跳过。F64/G8 每层 8 group/7 次有效 update，Middle 共 32 个相互独立的 recurrent scan。
+  reconstruction loss 只生成 fast-state update，不返回给 engine，也不加入 supervised loss。
+- 每层 `memory_gate` 零初始化，使 image checkpoint 初始化时模型函数严格保持 grouped-
+  window VideoViT baseline。初始 step gate 先收到 outer gradient；gate 打开后，作为
+  encoder 的 `w0/w2` 和作为 decoder 的 `w1` 都通过后续 group 获得 supervised
+  meta-gradient。
+- CUDA 在 window attention、memory/slow-MLP apply 和 update 粒度使用 `torch.compile`；
+  `use_checkpoint/checkpoint_num` 覆盖每层完整 recurrent scan 并保留 random mask、
+  attention dropout 和 drop-path RNG state，与 VideoLACT 的 recurrent checkpoint 原则一致。
+- Middle 默认 `dim=432`、depth 32、9 window-attention heads；64 帧/G8/400 类时总参数
+  114,238,480。32 层 state 的 `w0/w1/w2` 共 35,831,808 参数，与同配置 VideoLACT
+  fast weights 完全相同；MARS 没有 private Q/K/V/O projection，因此总参数少于
+  private-proj VideoLACT 的 138,112,528。
 
 ## LACT 参考实现与 chunk/update 结论
 
@@ -246,8 +230,9 @@
   `pos_embed`、每层 window attention/norm、slow MLP、最终 norm 和形状兼容的
   head。LACT 独有的 memory、fast weight、`lr_proj` 以及 private 模式下的新增
   projection 保持新初始化。
-- VideoMARS 加载相同的共享 trunk；`memory_norm`、fast-state encoder、tiny decoder、
-  `memory_gate` 和时间位置编码保持 MARS 初始化，其中 gate 必须保持全零。
+- VideoMARS 加载相同的逐层 window-attention/slow-MLP trunk；每层 `memory_norm`、
+  fast-state `w0/w1/w2`、`lr_proj`、`memory_gate` 和时间位置编码保持 MARS 初始化，
+  其中 gate 必须保持全零。
 - 分类与回归入口都必须让 `videolact_*` 和 `videomars_*` 使用独立空间/时间位置编码的
   checkpoint 插值分支，不能误走标准 VideoMAE 的联合位置编码分支。
 
@@ -418,7 +403,7 @@
   VideoMARS；epoch 0--7 validation top-1 为 34.38/58.63/65.69/69.96/72.15/
   73.94/75.07/75.81%，latest/best checkpoint 均保留。training/guard tmux、launcher、
   8 个 rank 和 guard 均已退出，8 张 GPU 回到约 4 MiB/0%，不得自动恢复该 run。
-- shared-pixel-MAE VideoMARS-Middle 的首个 K400 F64 run 脚本为
+- 已删除的 shared-pixel-MAE VideoMARS-Middle 历史首个 K400 F64 run 脚本为
   `videomamba/video_sm/exp/k400/videomars_middle/run_f64x224_no_ld_v1.sh`，run name 为
   `video-mars-middle-k400-f64x224-no-ld-v1`。它沿用 LACT F64/no-LD recipe 的 64 帧、
   每卡 batch 4、`num_sample=2`、10 epochs、1 epoch warmup、base LR `2e-4`、drop path
@@ -435,6 +420,8 @@
   grad norm 为 `2.75e4/7.13e7/7.62e11/1.23e12`；epoch 4 step 458 时按用户要求停止。
   根因是 update 后误沿 output dim 归一化以及 exact quintic NS meta-Jacobian 爆炸，
   因而该 run 科学上无效、所有 rank/GPU 已释放，绝不能 resume 或作为 MARS 能力结论。
+  该 v1 脚本现会立即报错退出，防止旧 W&B/run name 被新逐层 MARS 意外复用；启动新
+  MARS 实验必须按用户明确提供的新 run name 另建脚本。
 
 ## Weights & Biases 规则
 
@@ -496,6 +483,11 @@
 - VideoLACT：GPU FP32、H100 BF16、apply/update gradient checkpoint 反向均
   通过；默认 5 次 NS 的 `videolact_tiny` 已完成 `1x3x8x224x224 -> 400`
   真实尺寸推理。
+
+### 已删除的 VideoMARS 原型验证历史
+
+- 以下 shared pixel-MAE/fast-Transformer、normalized-ST 和旧 per-layer Transformer
+  数据仅用于解释历史决策，均不描述当前逐层 SwiGLU hidden-reconstruction MARS。
 - VideoMARS：model-wide shared-state 版本已验证 CPU FP32 前后向、training random
   mask、evaluation deterministic mask、`torch.no_grad()` 内 update-then-apply，以及
   pixel patchify/unpatchify 精确 round trip。显式打开 gate 后 fast input/output、
@@ -544,9 +536,37 @@
   encoder 64×1、decoder 32×1，B1 仍为 `9.7534 s/step`、`29.73 GiB`；改为唯一
   64×1 shared pixel-MAE prototype 后，同为 B1 的 step time 下降约 31.9 倍、
   allocated peak 下降约 11.2 倍。
+
+### 当前 VideoMARS 验证
+
+- 单元测试逐项确认 masked reconstruction 的手写 `w0/w1/w2` direction 等于对应
+  autograd loss 的负梯度；三矩阵合批 Muon 与逐矩阵 5-step NS 数值一致，update 后
+  fast weights 等于 master weights 沿 `dim=2` 的 LACT 归一化结果。将 reconstruction
+  mask 设为全 1 时，MARS fast/master update 与 `FastWeightSwiGLU.update_preprojected`
+  的 LACT 路径逐值一致，确认两者只差 masked-reconstruction objective。
+- 默认 dim-48/64-token 合成 hidden reconstruction 在 5 个随机 seed 上一次 update 都
+  降低 masked loss；seed 0 从 `26.5127` 降至 `16.5276`。逐层测试确认 exact NS
+  meta-gradient 同时到达 encoder `w0/w2` 与 decoder `w1`，且所有梯度 finite/nonzero。
+- CPU 已验证 per-layer 独立 state、training/evaluation mask 语义、完整模型前后向和
+  最后一组跳过 update；整层 checkpoint 与 eager 在相同随机 mask 下的输出、输入梯度
+  和全部参数梯度逐值一致。H100 BF16 已验证 `torch.compile` + 两层完整 recurrent-scan
+  checkpoint 前后向；2-group 小模型 encoder `w0/w2` 和 decoder `w1` grad norm 分别为
+  `0.1518/0.1624/0.1915`，均 finite/nonzero。
+- Middle/F64/G8 registry 构造参数量为 114,238,480；其中 32 层 MARS fast state 为
+  35,831,808，和 VideoLACT 的 `w0/w1/w2` 总量逐项相同。当前模型不存在根级
+  `shared_state`、pixel patchify、Transformer state 或 tiny decoder。
 - Image ViT 初始化：VideoViT、VideoLACT 和 VideoMARS 都已验证 2D patch kernel
   中心膨胀、window QKV/slow MLP 逐值加载及类别头跳过；LACT/MARS-only 参数保持
-  新初始化，MARS gate 保持全零。VideoMARS registry 构造和 Middle 参数量也已验证。
+  新初始化，MARS 每层 gate 保持全零。当前 MARS 真实 ImageViT best checkpoint 加载
+  78,136,704 个 trunk 参数，missing 仅每层 state/memory norm/LR/gate、时间位置编码和
+  400 类 head，无 unexpected key。
+- 当前 Middle/F64/G8 单 H100 BF16 合成训练步（32 层完整 scan checkpoint、gate 0.1、
+  label smoothing、AdamW，2 warmup/3 measure）稳定中位数为 `1.6216 s/step`、
+  `4.933 clips/s`，peak allocated/reserved 为 `14.68/15.59 GiB`；首个编译步约
+  `24.78 s`。该结果不含 DDP、视频解码和 dataloader。
+
+### VideoLACT/VideoViT 其他验证
+
 - VideoLACT：默认 CUDA compiled 和 compiled+checkpoint 路径均已在 H100 BF16
   验证，并确认生成 fused RMSNorm、SwiGLU/softplus backward、Muon bmm+norm 等
   Triton kernel；整层 recurrent-scan checkpoint 已在 CPU private/shared 模式以及

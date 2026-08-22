@@ -33,14 +33,18 @@ def _mars_grad_group_norms(model):
         if parameter.grad is None:
             continue
         name = name.removeprefix("module.")
-        if name.startswith("shared_state.state_encoder"):
+        if name.startswith("layers.") and name.endswith(
+            (".state.w0", ".state.w2")
+        ):
             group = "state_encoder"
-        elif name.startswith("shared_state.decoder"):
+        elif name.startswith("layers.") and name.endswith(".state.w1"):
             group = "decoder"
-        elif name == "shared_state.memory_norm.weight":
+        elif name.startswith("layers.") and ".memory_norm." in name:
             group = "memory_norm"
-        elif name == "shared_state.memory_gate":
+        elif name.startswith("layers.") and name.endswith(".memory_gate"):
             group = "memory_gate"
+        elif name.startswith("layers.") and ".lr_proj." in name:
+            group = "state_lr"
         elif name.startswith("layers."):
             group = "vit_trunk"
         elif name.startswith(

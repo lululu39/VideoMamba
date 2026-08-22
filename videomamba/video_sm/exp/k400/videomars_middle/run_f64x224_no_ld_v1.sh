@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "This v1 script belongs to the removed shared pixel-MAE MARS and must not be resumed or reused. Create a new run name/script for the per-layer hidden-reconstruction MARS." >&2
+exit 2
+
 RUN_NAME="video-mars-middle-k400-f64x224-no-ld-v1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_SM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"

@@ -27,18 +27,6 @@ def get_args():
     parser.add_argument("--measure-steps", type=int, default=5)
     parser.add_argument("--memory-gate", type=float, default=0.1)
     parser.add_argument("--checkpoint-num", type=int, default=32)
-    parser.add_argument("--mars-encoder-dim", type=int, default=None)
-    parser.add_argument("--mars-encoder-depth", type=int, default=2)
-    parser.add_argument("--mars-encoder-num-heads", type=int, default=None)
-    parser.add_argument("--mars-decoder-dim", type=int, default=64)
-    parser.add_argument("--mars-decoder-depth", type=int, default=1)
-    parser.add_argument("--mars-decoder-num-heads", type=int, default=1)
-    parser.add_argument(
-        "--mars-muon-backward",
-        choices=("exact", "straight_through", "normalized_straight_through"),
-        default="normalized_straight_through",
-    )
-    parser.add_argument("--mars-muon-backward-gain", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -67,21 +55,8 @@ def make_model(args):
             share_proj=False,
             share_init=True,
         )
-    else:
-        common.update(
-            mars_encoder_dim=args.mars_encoder_dim,
-            mars_encoder_depth=args.mars_encoder_depth,
-            mars_encoder_num_heads=args.mars_encoder_num_heads,
-            mars_decoder_dim=args.mars_decoder_dim,
-            mars_decoder_depth=args.mars_decoder_depth,
-            mars_decoder_num_heads=args.mars_decoder_num_heads,
-            mars_muon_backward=args.mars_muon_backward,
-            mars_muon_backward_gain=args.mars_muon_backward_gain,
-        )
     model = create_model(args.model, **common)
     with torch.no_grad():
-        if getattr(model, "shared_state", None) is not None:
-            model.shared_state.memory_gate.fill_(args.memory_gate)
         for layer in model.layers:
             if getattr(layer, "memory_gate", None) is not None:
                 layer.memory_gate.fill_(args.memory_gate)
