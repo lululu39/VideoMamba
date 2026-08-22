@@ -448,7 +448,11 @@
   10 epoch 约 35.2 小时，另需计 validation/checkpoint 时间。2026-08-22 按用户要求在
   epoch 0 step 434 用 SIGINT 关闭，以清理误导性的 encoder/decoder 代码术语；该修改
   不改变 `state.w0/w1/w2` 参数路径或任何数学。tmux/launcher/ranks 均已退出、GPU
-  已释放且没有 checkpoint，不得 resume `uk8zo0pq`，后续同名 run 从 ImageViT 重启。
+  已释放且没有 checkpoint，不得 resume `uk8zo0pq`。同名 run 随后从 ImageViT
+  checkpoint 全新重启，公网 W&B 为
+  `https://wandb.ai/LVSM-Experiment/videosft/runs/3oqzj911`，tmux/launcher PID 为
+  run name/`1351904`；step 20--31 稳态约 `1.67--1.68 s/step`、PyTorch peak
+  `28,094 MiB`，grad norm 约 3.1，确认纯术语修改没有改变速度和训练行为。
 
 ## Weights & Biases 规则
 
