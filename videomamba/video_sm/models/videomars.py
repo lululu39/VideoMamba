@@ -21,13 +21,12 @@ from .videolact import (
 )
 
 
-class MaskedFastWeightAutoencoder(FastWeightSwiGLU):
-    """One LACT SwiGLU viewed as an encoder followed by a decoder.
+class MaskedReconstructionSwiGLU(FastWeightSwiGLU):
+    """One LACT-shaped fast state with masked-feature reconstruction.
 
-    ``w0`` and ``w2`` encode a token into the gated hidden representation;
-    ``w1`` decodes that representation back to model width. The only change
-    from LACT's update objective is that input features are masked and the
-    reconstruction error is evaluated on those masked coordinates.
+    ``w0``, ``w2``, and ``w1`` are respectively the gate, up, and down
+    matrices of one SwiGLU mapping. The input features are masked and the
+    reconstruction error is evaluated only on those masked coordinates.
     """
 
     num_weights = 3
@@ -54,17 +53,8 @@ class MaskedFastWeightAutoencoder(FastWeightSwiGLU):
     def state_parameters(self):
         return (self.w0, self.w1, self.w2)
 
-    def encode(self, x, fast_weights):
-        """Apply the trained encoder/decoder state as the memory mapping."""
-        if len(fast_weights) != self.num_weights:
-            raise ValueError(
-                f"Expected {self.num_weights} fast weights, got "
-                f"{len(fast_weights)}"
-            )
-        return self.forward(x, fast_weights)
-
     def reconstruct(self, masked_input, fast_weights):
-        """Run the raw LACT encoder/decoder used by the inner objective."""
+        """Run the raw SwiGLU mapping used by the inner objective."""
         reconstruction, input_heads, gate, up, hidden = self._apply_fast_weights(
             masked_input,
             fast_weights,
@@ -257,7 +247,7 @@ class MARSBlock(nn.Module):
             TensorDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
         self.memory_norm = norm_cls(dim, **factory_kwargs)
-        self.state = MaskedFastWeightAutoencoder(
+        self.state = MaskedReconstructionSwiGLU(
             dim,
             inter_multi=fw_inter_multi,
             num_heads=fw_num_heads,
@@ -267,7 +257,7 @@ class MARSBlock(nn.Module):
         self.memory_gate = nn.Parameter(torch.zeros(dim, **factory_kwargs))
         self.lr_proj = nn.Linear(
             dim,
-            MaskedFastWeightAutoencoder.num_weights,
+            MaskedReconstructionSwiGLU.num_weights,
             bias=False,
             **factory_kwargs,
         )
@@ -324,7 +314,7 @@ class MARSBlock(nn.Module):
         memory_input = self.memory_norm(
             flat_x.to(dtype=self.memory_norm.weight.dtype)
         )
-        memory_output = self.state.encode(memory_input, fast_weights)
+        memory_output = self.state(memory_input, fast_weights)
         memory_output = memory_output * self.memory_gate
         x = x + self.drop_path(memory_output.reshape_as(x))
         flat_x = x.reshape(batch_size * group_size, seq_len, dim)
@@ -438,8 +428,8 @@ class MARSBlock(nn.Module):
         update_index,
         *weights,
     ):
-        fast_weights = weights[: MaskedFastWeightAutoencoder.num_weights]
-        master_weights = weights[MaskedFastWeightAutoencoder.num_weights :]
+        fast_weights = weights[: MaskedReconstructionSwiGLU.num_weights]
+        master_weights = weights[MaskedReconstructionSwiGLU.num_weights :]
         prediction_input = F.rms_norm(
             memory_input,
             normalized_shape=(self.dim,),
@@ -490,7 +480,7 @@ class MARSBlock(nn.Module):
             outputs = self._compiled_update_fast_weights(*args)
         else:
             outputs = self._update_fast_weights(*args)
-        split = MaskedFastWeightAutoencoder.num_weights
+        split = MaskedReconstructionSwiGLU.num_weights
         return outputs[:split], outputs[split:]
 
     def _forward_scan(self, x, fw_update_group_size):

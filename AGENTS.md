@@ -120,14 +120,14 @@
   编码。`window_size == chunk_size == (N + 1) * fw_update_group_size`，分类/回归
   CLI 未显式设置 tubelet size 时默认用 1。分类读取最后一个 tubelet 的 CLS。
 - 每层维护独立的 per-sample fast state，不跨层共享。state 是一个与 LACT 完全同形的
-  multi-head SwiGLU：`w0/w2` 把 hidden token 编码为 gated latent，`w1` 把 latent
-  解码回模型宽度，因此它同时是轻量 encoder/decoder；不再包含 Transformer、Q/K/V、
-  attention、独立 input/output projection 或 persistent tiny decoder。默认
-  `fw_inter_multi=2`、`fw_num_heads=1`、`fw_base_lr=0.01`。
+  multi-head SwiGLU：`w0`、`w2`、`w1` 分别是同一个 state mapping 的 gate、up、down
+  fast matrix，完整映射为 `(SiLU(x @ w0) * (x @ w2)) @ w1`；它们不是独立的
+  encoder/decoder。state 不包含 Transformer、Q/K/V、attention 或辅助 reconstruction
+  网络。默认 `fw_inter_multi=2`、`fw_num_heads=1`、`fw_base_lr=0.01`。
 - inner objective 是 masked hidden-state reconstruction。window attention 后的归一化
   hidden state 是 stop-gradient target；对每个 sample/chunk 随机精确 mask 默认 50%
   hidden channels，并在整个 chunk 的 token 上复用该 channel mask。masked input 将这些
-  channel 清零，state decoder 只在被 mask 的坐标上重建原 hidden。采用 feature mask
+  channel 清零，完整 SwiGLU state mapping 只在被 mask 的坐标上重建原 hidden。采用 feature mask
   而非整 token mask，是因为没有 token-mixing Transformer 的 SwiGLU 必须从同一 token
   的可见 feature 恢复缺失 feature；评估态 mask 只由 layer/group index 决定且不消耗 RNG。
 - update 数学除 reconstruction mask 外逐项复用 LACT：误差为
@@ -138,8 +138,8 @@
 - MARS 不再使用 `torch.autograd.grad(create_graph=True)`，也不再使用 Muon straight-
   through surrogate。解析 inner gradient、exact NS、master update 和归一化都是普通
   differentiable tensor 运算，因此 outer classification/regression loss 会像 LACT 一样
-  得到完整 exact meta-gradient。旧 `mars_encoder_*`、`mars_decoder_*`、
-  `mars_muon_backward*` CLI 仅为 archived 脚本兼容而接受，当前模型会忽略它们。
+  得到完整 exact meta-gradient。误导性的旧 `mars_encoder_*`、`mars_decoder_*` CLI
+  已删除；`mars_muon_backward*` 仅为 archived 脚本兼容而接受，当前模型会忽略它们。
 - 调度严格为 apply-then-update：一个 group 用旧 state 完成 memory residual 和 slow MLP，
   当前 masked reconstruction update 只能供后续 group 使用；最后一个无消费者的 update
   跳过。F64/G8 每层 8 group/7 次有效 update，Middle 共 32 个相互独立的 recurrent scan。
@@ -150,8 +150,7 @@
   reconstruction loss 只生成 fast-state update，不返回给 engine，也不加入 supervised loss。
 - 每层 `memory_gate` 零初始化，使 image checkpoint 初始化时模型函数严格保持 grouped-
   window VideoViT baseline。初始 step gate 先收到 outer gradient；gate 打开后，作为
-  encoder 的 `w0/w2` 和作为 decoder 的 `w1` 都通过后续 group 获得 supervised
-  meta-gradient。
+  gate/up/down 的 `w0/w2/w1` 都通过后续 group 获得 supervised meta-gradient。
 - CUDA 在 window attention、memory/slow-MLP apply 和 update 粒度使用 `torch.compile`。
   G1 的 `use_checkpoint/checkpoint_num` 继续覆盖每层完整 recurrent scan；cross-layer
   模式则与 LACT 严格参考路径一样，checkpoint 每个 chunk 的单层完整 block apply 及
@@ -446,7 +445,10 @@
   的 20-step rolling time 中位数为 `1.6879 s/step`，PyTorch peak `28,094 MiB`、
   `nvidia-smi` 约 `35.0--35.2 GiB`/卡，grad norm 约 3.1--3.2、loss scale 65,536，
   没有 NaN/OOM。八卡进程均为该 launcher 后代；纯训练粗算每 epoch 约 3.52 小时、
-  10 epoch 约 35.2 小时，另需计 validation/checkpoint 时间。
+  10 epoch 约 35.2 小时，另需计 validation/checkpoint 时间。2026-08-22 按用户要求在
+  epoch 0 step 434 用 SIGINT 关闭，以清理误导性的 encoder/decoder 代码术语；该修改
+  不改变 `state.w0/w1/w2` 参数路径或任何数学。tmux/launcher/ranks 均已退出、GPU
+  已释放且没有 checkpoint，不得 resume `uk8zo0pq`，后续同名 run 从 ImageViT 重启。
 
 ## Weights & Biases 规则
 
@@ -571,15 +573,15 @@
   的 LACT 路径逐值一致，确认两者只差 masked-reconstruction objective。
 - 默认 dim-48/64-token 合成 hidden reconstruction 在 5 个随机 seed 上一次 update 都
   降低 masked loss；seed 0 从 `26.5127` 降至 `16.5276`。逐层测试确认 exact NS
-  meta-gradient 同时到达 encoder `w0/w2` 与 decoder `w1`，且所有梯度 finite/nonzero。
+  meta-gradient 同时到达 gate/up/down `w0/w2/w1`，且所有梯度 finite/nonzero。
 - CPU 已验证 per-layer 独立 state、training/evaluation mask 语义、完整模型前后向和
   最后一组跳过 update；整层 checkpoint 与 eager 在相同随机 mask 下的输出、输入梯度
   和全部参数梯度逐值一致。H100 BF16 已验证 `torch.compile` + 两层完整 recurrent-scan
-  checkpoint 前后向；2-group 小模型 encoder `w0/w2` 和 decoder `w1` grad norm 分别为
+  checkpoint 前后向；2-group 小模型 `w0/w2/w1` grad norm 分别为
   `0.1518/0.1624/0.1915`，均 finite/nonzero。
 - Middle/F64/G8 registry 构造参数量为 114,238,480；其中 32 层 MARS fast state 为
   35,831,808，和 VideoLACT 的 `w0/w1/w2` 总量逐项相同。当前模型不存在根级
-  `shared_state`、pixel patchify、Transformer state 或 tiny decoder。
+  `shared_state`、pixel patchify、Transformer state 或辅助 reconstruction 网络。
 - Image ViT 初始化：VideoViT、VideoLACT 和 VideoMARS 都已验证 2D patch kernel
   中心膨胀、window QKV/slow MLP 逐值加载及类别头跳过；LACT/MARS-only 参数保持
   新初始化，MARS 每层 gate 保持全零。当前 MARS 真实 ImageViT best checkpoint 加载

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from videomamba.video_sm.models.videomars import (
     MARSBlock,
-    MaskedFastWeightAutoencoder,
+    MaskedReconstructionSwiGLU,
     VisionMARS,
 )
 from videomamba.video_sm.models.videolact import (
@@ -17,10 +17,10 @@ from videomamba.video_sm.models.videolact import (
 )
 
 
-class MaskedFastWeightAutoencoderTest(unittest.TestCase):
+class MaskedReconstructionSwiGLUTest(unittest.TestCase):
     @staticmethod
     def _make_state():
-        return MaskedFastWeightAutoencoder(
+        return MaskedReconstructionSwiGLU(
             dim=8,
             inter_multi=2,
             num_heads=1,
@@ -132,7 +132,7 @@ class MaskedFastWeightAutoencoderTest(unittest.TestCase):
 
     def test_one_muon_update_reduces_masked_reconstruction_loss(self):
         torch.manual_seed(0)
-        state = MaskedFastWeightAutoencoder(48, inter_multi=2, num_heads=1)
+        state = MaskedReconstructionSwiGLU(48, inter_multi=2, num_heads=1)
         fast_weights, master_weights = state.init_fast_weights(batch_size=2)
         target = torch.randn(2, 64, 48)
         mask = torch.zeros_like(target, dtype=torch.bool)
@@ -183,7 +183,7 @@ class PerLayerMARSTest(unittest.TestCase):
         self.assertEqual(first[:, 0].sum(dim=-1).tolist(), [6, 6])
         torch.testing.assert_close(first[:, :1].expand_as(first), first)
 
-    def test_two_groups_give_encoder_and_decoder_exact_meta_gradients(self):
+    def test_two_groups_give_all_state_weights_exact_meta_gradients(self):
         torch.manual_seed(3)
         block = self._make_block().train()
         with torch.no_grad():
@@ -192,7 +192,7 @@ class PerLayerMARSTest(unittest.TestCase):
         output = block.forward_scan(x, fw_update_group_size=1)
         output.square().mean().backward()
 
-        # w0/w2 form the encoder and w1 is the decoder.
+        # Gate/up/down are all part of one state mapping.
         for parameters in (
             (block.state.w0, block.state.w2),
             (block.state.w1,),

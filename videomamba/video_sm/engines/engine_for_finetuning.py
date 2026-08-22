@@ -36,9 +36,9 @@ def _mars_grad_group_norms(model):
         if name.startswith("layers.") and name.endswith(
             (".state.w0", ".state.w2")
         ):
-            group = "state_encoder"
+            group = "state_gate_up"
         elif name.startswith("layers.") and name.endswith(".state.w1"):
-            group = "decoder"
+            group = "state_down"
         elif name.startswith("layers.") and ".memory_norm." in name:
             group = "memory_norm"
         elif name.startswith("layers.") and name.endswith(".memory_gate"):

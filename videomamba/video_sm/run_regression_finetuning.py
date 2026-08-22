@@ -64,7 +64,7 @@ def get_args():
     parser.add_argument(
         '--fw_update_layer_group_size', type=int, default=1,
         help=(
-            'LACT fast-weight update layer batch. 1 keeps the optimized '
+            'LACT/MARS fast-weight update layer batch. 1 keeps the optimized '
             'layer-major scan; values >1 select the reference chunk-major '
             'scan and batch this many layer updates (use model depth to '
             'batch all layers; default: 1)'
@@ -72,21 +72,6 @@ def get_args():
     )
     parser.add_argument('--muon_update_steps', type=int, default=5)
     parser.add_argument('--mars_mask_ratio', type=float, default=0.5)
-    # Deprecated pre-redesign MARS options; accepted only for parse compatibility.
-    parser.add_argument('--mars_encoder_dim', type=int, default=None,
-                        help=argparse.SUPPRESS)
-    parser.add_argument('--mars_encoder_depth', type=int, default=2,
-                        help=argparse.SUPPRESS)
-    parser.add_argument('--mars_encoder_num_heads', type=int, default=None,
-                        help=argparse.SUPPRESS)
-    parser.add_argument('--mars_decoder_dim', type=int, default=64,
-                        help=argparse.SUPPRESS)
-    parser.add_argument('--mars_decoder_depth', type=int, default=1,
-                        help=argparse.SUPPRESS)
-    parser.add_argument('--mars_decoder_num_heads', type=int, default=1,
-                        help=argparse.SUPPRESS)
-    parser.add_argument('--mars_decoder_mlp_ratio', type=float, default=2.0,
-                        help=argparse.SUPPRESS)
     parser.add_argument(
         '--mars_muon_backward',
         choices=('exact', 'straight_through', 'normalized_straight_through'),
