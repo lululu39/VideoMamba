@@ -72,7 +72,11 @@ def get_args():
     )
     parser.add_argument('--muon_update_steps', type=int, default=5)
     parser.add_argument('--mars_mask_ratio', type=float, default=0.5)
+    parser.add_argument('--mars_encoder_dim', type=int, default=None)
+    parser.add_argument('--mars_encoder_depth', type=int, default=2)
+    parser.add_argument('--mars_encoder_num_heads', type=int, default=None)
     parser.add_argument('--mars_decoder_dim', type=int, default=64)
+    parser.add_argument('--mars_decoder_depth', type=int, default=1)
     parser.add_argument('--mars_decoder_num_heads', type=int, default=1)
     parser.add_argument('--mars_decoder_mlp_ratio', type=float, default=2.0)
     share_proj_group = parser.add_mutually_exclusive_group()
@@ -456,11 +460,14 @@ def main(args, ds_init):
             kernel_size=args.tubelet_size,
             num_frames=args.num_frames,
             fw_inter_multi=args.fw_inter_multi,
-            fw_num_heads=args.fw_num_heads,
             fw_update_group_size=args.fw_update_group_size,
             muon_update_steps=args.muon_update_steps,
             mars_mask_ratio=args.mars_mask_ratio,
+            mars_encoder_dim=args.mars_encoder_dim,
+            mars_encoder_depth=args.mars_encoder_depth,
+            mars_encoder_num_heads=args.mars_encoder_num_heads,
             mars_decoder_dim=args.mars_decoder_dim,
+            mars_decoder_depth=args.mars_decoder_depth,
             mars_decoder_num_heads=args.mars_decoder_num_heads,
             mars_decoder_mlp_ratio=args.mars_decoder_mlp_ratio,
             use_checkpoint=args.use_checkpoint,

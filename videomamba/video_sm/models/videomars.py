@@ -41,129 +41,228 @@ def _sincos_position_embedding(length, dim, device=None):
     return embedding
 
 
-class FastWeightEncoder(nn.Module):
-    """Per-sample multi-head SwiGLU state, matching LACT state size."""
+class FastTransformerStateLayer(nn.Module):
+    """Base parameters for one per-sample fast Transformer encoder layer."""
+
+    def __init__(self, dim, inter_multi=2, device=None, dtype=None):
+        super().__init__()
+        if inter_multi <= 0:
+            raise ValueError(f"inter_multi must be positive, got {inter_multi}")
+        parameter_kwargs = {
+            key: value
+            for key, value in {"device": device, "dtype": dtype}.items()
+            if value is not None
+        }
+        hidden_dim = int(dim * inter_multi)
+        if hidden_dim <= 0:
+            raise ValueError(
+                f"inter_multi={inter_multi} gives invalid hidden dim {hidden_dim}"
+            )
+        self.wq = nn.Parameter(
+            torch.randn(dim, dim, **parameter_kwargs) / math.sqrt(dim)
+        )
+        self.wk = nn.Parameter(
+            torch.randn(dim, dim, **parameter_kwargs) / math.sqrt(dim)
+        )
+        self.wv = nn.Parameter(
+            torch.randn(dim, dim, **parameter_kwargs) / math.sqrt(dim)
+        )
+        self.wo = nn.Parameter(
+            torch.randn(dim, dim, **parameter_kwargs) / math.sqrt(dim)
+        )
+        self.w0 = nn.Parameter(
+            torch.randn(dim, hidden_dim, **parameter_kwargs) / math.sqrt(dim)
+        )
+        self.w1 = nn.Parameter(
+            torch.randn(hidden_dim, dim, **parameter_kwargs)
+            / math.sqrt(hidden_dim)
+        )
+        self.w2 = nn.Parameter(
+            torch.randn(dim, hidden_dim, **parameter_kwargs) / math.sqrt(dim)
+        )
+
+    def state_parameters(self):
+        return (self.wq, self.wk, self.wv, self.wo, self.w0, self.w1, self.w2)
+
+
+class FastWeightTransformerEncoder(nn.Module):
+    """Per-sample explicit-attention Transformer used as recurrent state."""
+
+    weights_per_layer = 7
 
     def __init__(
         self,
-        dim,
-        inter_multi=2,
+        input_dim,
+        encoder_dim,
+        depth=2,
         num_heads=1,
+        inter_multi=2,
         norm_epsilon=1e-5,
         device=None,
         dtype=None,
     ):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-        if inter_multi <= 0:
-            raise ValueError(f"inter_multi must be positive, got {inter_multi}")
-        factory_kwargs = {"device": device, "dtype": dtype}
+        if depth <= 0:
+            raise ValueError(f"depth must be positive, got {depth}")
+        if encoder_dim <= 0:
+            raise ValueError(f"encoder_dim must be positive, got {encoder_dim}")
+        if encoder_dim % num_heads != 0:
+            raise ValueError(
+                f"encoder_dim={encoder_dim} must be divisible by num_heads={num_heads}"
+            )
         parameter_kwargs = {
-            key: value for key, value in factory_kwargs.items() if value is not None
+            key: value
+            for key, value in {"device": device, "dtype": dtype}.items()
+            if value is not None
         }
-        self.dim = dim
+        self.input_dim = input_dim
+        self.encoder_dim = encoder_dim
+        self.depth = depth
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.hidden_dim = int(dim * inter_multi)
-        self.w0 = nn.Parameter(
-            torch.randn(
-                num_heads,
-                self.head_dim,
-                self.hidden_dim,
-                **parameter_kwargs,
-            )
-            / math.sqrt(self.head_dim)
+        self.head_dim = encoder_dim // num_heads
+        self.scale = self.head_dim**-0.5
+        self.norm_epsilon = norm_epsilon
+        self.input_proj = nn.Parameter(
+            torch.randn(input_dim, encoder_dim, **parameter_kwargs)
+            / math.sqrt(input_dim)
         )
-        self.w1 = nn.Parameter(
-            torch.randn(
-                num_heads,
-                self.hidden_dim,
-                self.head_dim,
-                **parameter_kwargs,
-            )
-            / math.sqrt(self.hidden_dim)
+        self.transformer_layers = nn.ModuleList(
+            [
+                FastTransformerStateLayer(
+                    encoder_dim,
+                    inter_multi=inter_multi,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(depth)
+            ]
         )
-        self.w2 = nn.Parameter(
-            torch.randn(
-                num_heads,
-                self.head_dim,
-                self.hidden_dim,
-                **parameter_kwargs,
-            )
-            / math.sqrt(self.head_dim)
+        self.output_proj = nn.Parameter(
+            torch.randn(encoder_dim, input_dim, **parameter_kwargs)
+            / math.sqrt(encoder_dim)
         )
-        self.output_norm = nn.RMSNorm(
-            dim,
-            eps=norm_epsilon,
-            elementwise_affine=False,
-            **factory_kwargs,
-        )
+
+    def state_parameters(self):
+        weights = [self.input_proj]
+        for layer in self.transformer_layers:
+            weights.extend(layer.state_parameters())
+        weights.append(self.output_proj)
+        return tuple(weights)
 
     def init_state(self, batch_size):
         master_weights = tuple(
-            weight.float().unsqueeze(0).repeat(batch_size, 1, 1, 1)
-            for weight in (self.w0, self.w1, self.w2)
+            weight.float().unsqueeze(0).repeat(batch_size, 1, 1)
+            for weight in self.state_parameters()
         )
         fast_dtype = (
             torch.bfloat16 if master_weights[0].is_cuda else master_weights[0].dtype
         )
         fast_weights = tuple(
-            F.normalize(weight, dim=2, eps=1e-5).to(fast_dtype)
+            F.normalize(weight, dim=1, eps=1e-5).to(fast_dtype)
             for weight in master_weights
         )
         return fast_weights, master_weights
 
-    def forward(self, x, fast_weights):
-        w0, w1, w2 = fast_weights
-        output_dtype = x.dtype
-        x = x.to(w0.dtype)
+    @staticmethod
+    def _linear(x, weight):
+        return torch.einsum("bld,bdk->blk", x.to(weight.dtype), weight)
+
+    def _attention(self, x, wq, wk, wv, wo):
         batch_size, seq_len, _ = x.shape
-        x_heads = x.reshape(
+        query = self._linear(x, wq).reshape(
             batch_size,
             seq_len,
             self.num_heads,
             self.head_dim,
         )
-        gate = torch.einsum("blhd,bhdk->blhk", x_heads, w0)
-        up = torch.einsum("blhd,bhdk->blhk", x_heads, w2)
-        hidden = F.silu(gate) * up
-        output = torch.einsum("blhk,bhkd->blhd", hidden, w1)
-        output = output.reshape(batch_size, seq_len, self.dim).to(output_dtype)
-        return self.output_norm(output)
+        key = self._linear(x, wk).reshape_as(query)
+        value = self._linear(x, wv).reshape_as(query)
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
+        attention = torch.softmax(
+            (query @ key.transpose(-1, -2)) * self.scale,
+            dim=-1,
+        )
+        output = (attention @ value).transpose(1, 2).reshape(
+            batch_size,
+            seq_len,
+            self.encoder_dim,
+        )
+        return self._linear(output, wo)
+
+    def forward(self, x, fast_weights):
+        expected_weights = 2 + self.depth * self.weights_per_layer
+        if len(fast_weights) != expected_weights:
+            raise ValueError(
+                f"Expected {expected_weights} fast weights, got {len(fast_weights)}"
+            )
+        output_dtype = x.dtype
+        hidden = self._linear(x, fast_weights[0])
+        offset = 1
+        for _ in range(self.depth):
+            wq, wk, wv, wo, w0, w1, w2 = fast_weights[
+                offset : offset + self.weights_per_layer
+            ]
+            offset += self.weights_per_layer
+            attention_input = F.rms_norm(
+                hidden,
+                normalized_shape=(self.encoder_dim,),
+                eps=self.norm_epsilon,
+            )
+            hidden = hidden + self._attention(
+                attention_input,
+                wq,
+                wk,
+                wv,
+                wo,
+            )
+            mlp_input = F.rms_norm(
+                hidden,
+                normalized_shape=(self.encoder_dim,),
+                eps=self.norm_epsilon,
+            )
+            gate = self._linear(mlp_input, w0)
+            up = self._linear(mlp_input, w2)
+            hidden = hidden + self._linear(F.silu(gate) * up, w1)
+        hidden = F.rms_norm(
+            hidden,
+            normalized_shape=(self.encoder_dim,),
+            eps=self.norm_epsilon,
+        )
+        output = self._linear(hidden, fast_weights[-1]).to(output_dtype)
+        return F.rms_norm(
+            output,
+            normalized_shape=(self.input_dim,),
+            eps=self.norm_epsilon,
+        )
 
     def muon_descent(self, gradients, steps):
-        """Apply the same batched Muon/NS orientation used by VideoLACT."""
-        grad_w0, grad_w1, grad_w2 = gradients
-        transpose_w02 = self.head_dim > self.hidden_dim
-        if transpose_w02:
-            oriented = torch.stack(
-                (
-                    grad_w0.transpose(-1, -2),
-                    grad_w1,
-                    grad_w2.transpose(-1, -2),
+        """Batch same-shaped matrices for LACT-style quintic NS updates."""
+        grouped = {}
+        for index, gradient in enumerate(gradients):
+            transpose = gradient.shape[-2] > gradient.shape[-1]
+            oriented = gradient.transpose(-1, -2) if transpose else gradient
+            key = tuple(oriented.shape[-2:])
+            grouped.setdefault(key, []).append((index, transpose, oriented))
+
+        updates = [None] * len(gradients)
+        for entries in grouped.values():
+            oriented = torch.stack([entry[2] for entry in entries])
+            transformed = zeropower_via_newtonschulz5(
+                oriented.flatten(0, 1),
+                steps,
+            ).reshape_as(oriented)
+            for transformed_weight, (index, transpose, _) in zip(
+                transformed,
+                entries,
+            ):
+                updates[index] = (
+                    transformed_weight.transpose(-1, -2)
+                    if transpose
+                    else transformed_weight
                 )
-            )
-        else:
-            oriented = torch.stack(
-                (
-                    grad_w0,
-                    grad_w1.transpose(-1, -2),
-                    grad_w2,
-                )
-            )
-        updates = zeropower_via_newtonschulz5(
-            oriented.flatten(0, 2),
-            steps,
-        ).reshape_as(oriented)
-        update_w0, update_w1_oriented, update_w2 = updates.unbind(0)
-        if transpose_w02:
-            update_w0 = update_w0.transpose(-1, -2)
-            update_w1 = update_w1_oriented
-            update_w2 = update_w2.transpose(-1, -2)
-        else:
-            update_w1 = update_w1_oriented.transpose(-1, -2)
-        return update_w0, update_w1, update_w2
+        return tuple(updates)
 
 
 class TinyDecoderAttention(nn.Module):
@@ -205,8 +304,53 @@ class TinyDecoderAttention(nn.Module):
         return self.out_proj(output)
 
 
+class TinyDecoderBlock(nn.Module):
+    """One persistent explicit-attention Transformer decoder block."""
+
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=2.0,
+        norm_epsilon=1e-5,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        hidden_dim = int(dim * mlp_ratio)
+        if hidden_dim <= 0:
+            raise ValueError(
+                f"mlp_ratio={mlp_ratio} gives invalid hidden dim {hidden_dim}"
+            )
+        self.norm_attn = nn.RMSNorm(
+            dim,
+            eps=norm_epsilon,
+            **factory_kwargs,
+        )
+        self.attn = TinyDecoderAttention(
+            dim,
+            num_heads=num_heads,
+            **factory_kwargs,
+        )
+        self.norm_mlp = nn.RMSNorm(
+            dim,
+            eps=norm_epsilon,
+            **factory_kwargs,
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim, **factory_kwargs),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim, **factory_kwargs),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm_attn(x))
+        return x + self.mlp(self.norm_mlp(x))
+
+
 class TinyMaskedDecoder(nn.Module):
-    """One small attention block used only to form the state-update loss."""
+    """Small configurable Transformer used only to form the inner loss."""
 
     def __init__(
         self,
@@ -214,6 +358,7 @@ class TinyMaskedDecoder(nn.Module):
         decoder_dim,
         num_heads,
         max_chunk_size,
+        depth=1,
         mlp_ratio=2.0,
         norm_epsilon=1e-5,
         device=None,
@@ -224,8 +369,9 @@ class TinyMaskedDecoder(nn.Module):
             raise ValueError(
                 f"decoder_dim={decoder_dim} must be divisible by num_heads={num_heads}"
             )
+        if depth <= 0:
+            raise ValueError(f"depth must be positive, got {depth}")
         factory_kwargs = {"device": device, "dtype": dtype}
-        hidden_dim = int(decoder_dim * mlp_ratio)
         self.decoder_dim = decoder_dim
         self.encoder_to_decoder = nn.Linear(
             input_dim,
@@ -236,25 +382,17 @@ class TinyMaskedDecoder(nn.Module):
         self.mask_token = nn.Parameter(
             torch.zeros(1, 1, decoder_dim, **factory_kwargs)
         )
-        self.norm_attn = nn.RMSNorm(
-            decoder_dim,
-            eps=norm_epsilon,
-            **factory_kwargs,
-        )
-        self.attn = TinyDecoderAttention(
-            decoder_dim,
-            num_heads=num_heads,
-            **factory_kwargs,
-        )
-        self.norm_mlp = nn.RMSNorm(
-            decoder_dim,
-            eps=norm_epsilon,
-            **factory_kwargs,
-        )
-        self.mlp = nn.Sequential(
-            nn.Linear(decoder_dim, hidden_dim, **factory_kwargs),
-            nn.GELU(),
-            nn.Linear(hidden_dim, decoder_dim, **factory_kwargs),
+        self.blocks = nn.ModuleList(
+            [
+                TinyDecoderBlock(
+                    decoder_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    norm_epsilon=norm_epsilon,
+                    **factory_kwargs,
+                )
+                for _ in range(depth)
+            ]
         )
         self.norm_out = nn.RMSNorm(
             decoder_dim,
@@ -296,8 +434,8 @@ class TinyMaskedDecoder(nn.Module):
             dtype=tokens.dtype,
         )
         tokens = tokens + positions.unsqueeze(0)
-        tokens = tokens + self.attn(self.norm_attn(tokens))
-        tokens = tokens + self.mlp(self.norm_mlp(tokens))
+        for block in self.blocks:
+            tokens = block(tokens)
         return self.predict(self.norm_out(tokens))
 
 
@@ -319,10 +457,13 @@ class MARSBlock(nn.Module):
         mlp_ratio=3.0,
         residual_in_fp32=True,
         fw_inter_multi=2,
-        fw_num_heads=1,
+        encoder_dim=288,
+        encoder_depth=2,
+        encoder_num_heads=6,
         muon_update_steps=5,
         mask_ratio=0.5,
         decoder_dim=64,
+        decoder_depth=1,
         decoder_num_heads=1,
         decoder_mlp_ratio=2.0,
         norm_epsilon=1e-5,
@@ -357,10 +498,12 @@ class MARSBlock(nn.Module):
             TensorDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
         self.memory_norm = norm_cls(dim, **factory_kwargs)
-        self.state_encoder = FastWeightEncoder(
-            dim,
+        self.state_encoder = FastWeightTransformerEncoder(
+            input_dim=dim,
+            encoder_dim=encoder_dim,
+            depth=encoder_depth,
+            num_heads=encoder_num_heads,
             inter_multi=fw_inter_multi,
-            num_heads=fw_num_heads,
             norm_epsilon=norm_epsilon,
             **factory_kwargs,
         )
@@ -369,6 +512,7 @@ class MARSBlock(nn.Module):
             decoder_dim=decoder_dim,
             num_heads=decoder_num_heads,
             max_chunk_size=max_chunk_size,
+            depth=decoder_depth,
             mlp_ratio=decoder_mlp_ratio,
             norm_epsilon=norm_epsilon,
             **factory_kwargs,
@@ -605,11 +749,14 @@ class VisionMARS(nn.Module):
         num_frames=8,
         fc_drop_rate=0.0,
         fw_inter_multi=2,
-        fw_num_heads=1,
         muon_update_steps=5,
         fw_update_group_size=1,
         mars_mask_ratio=0.5,
+        mars_encoder_dim=None,
+        mars_encoder_depth=2,
+        mars_encoder_num_heads=None,
         mars_decoder_dim=64,
+        mars_decoder_depth=1,
         mars_decoder_num_heads=1,
         mars_decoder_mlp_ratio=2.0,
         device=None,
@@ -631,11 +778,19 @@ class VisionMARS(nn.Module):
                 "fw_update_group_size must be positive, got "
                 f"{fw_update_group_size}"
             )
+        if mars_encoder_dim is None:
+            mars_encoder_dim = 2 * embed_dim // 3
+        if mars_encoder_num_heads is None:
+            mars_encoder_num_heads = max(1, 2 * num_heads // 3)
         factory_kwargs = {"device": device, "dtype": dtype}
         self.use_checkpoint = use_checkpoint
         self.checkpoint_num = checkpoint_num
         self.num_classes = num_classes
         self.d_model = self.num_features = self.embed_dim = embed_dim
+        self.mars_encoder_dim = mars_encoder_dim
+        self.mars_encoder_depth = mars_encoder_depth
+        self.mars_encoder_num_heads = mars_encoder_num_heads
+        self.mars_decoder_depth = mars_decoder_depth
         self.patch_embed = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,
@@ -687,10 +842,13 @@ class VisionMARS(nn.Module):
                     mlp_ratio=mlp_ratio,
                     residual_in_fp32=residual_in_fp32,
                     fw_inter_multi=fw_inter_multi,
-                    fw_num_heads=fw_num_heads,
+                    encoder_dim=mars_encoder_dim,
+                    encoder_depth=mars_encoder_depth,
+                    encoder_num_heads=mars_encoder_num_heads,
                     muon_update_steps=muon_update_steps,
                     mask_ratio=mars_mask_ratio,
                     decoder_dim=mars_decoder_dim,
+                    decoder_depth=mars_decoder_depth,
                     decoder_num_heads=mars_decoder_num_heads,
                     decoder_mlp_ratio=mars_decoder_mlp_ratio,
                     norm_epsilon=norm_epsilon,
