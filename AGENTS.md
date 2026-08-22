@@ -407,6 +407,10 @@
   `1.76--1.77 s/step`，step 80--105 的日志 time 中位数为 `1.798 s`（范围
   1.772--1.804 秒）；PyTorch peak `28,745 MiB`、`nvidia-smi` 每卡约 `35.0 GiB`，
   该窗口 grad norm 中位数约 3.18。GPU watchdog 每 5 秒清除非 launcher 后代。
+  2026-08-22 按用户要求在 epoch 8 step 4861/7513 用 SIGINT 正常关闭，以优先测试
+  VideoMARS；epoch 0--7 validation top-1 为 34.38/58.63/65.69/69.96/72.15/
+  73.94/75.07/75.81%，latest/best checkpoint 均保留。training/guard tmux、launcher、
+  8 个 rank 和 guard 均已退出，8 张 GPU 回到约 4 MiB/0%，不得自动恢复该 run。
 
 ## Weights & Biases 规则
 
@@ -486,6 +490,28 @@
   index 检查确认所有 per-tubelet CLS 都保留为 visible token，且只有一个 group 时
   decoder 不参与计算，确认最后一次无效 update 已跳过。只修改早期 group、保持最后
   group 输入不变时，最后 group 输出最大变化约 0.196，确认 state 正在跨 group 传递。
+- VideoMARS/VideoLACT F64 训练 step 对照使用
+  `videomamba/video_sm/benchmark_mars_lact.py`：单张 H100、224²、64 帧、G8、BF16、
+  drop-path 0.8、label smoothing、AdamW、memory gate 0.1；完成 warmup 的结果包含
+  optimizer state，MARS 则在首个 forward、Adam state 尚未建立前就已 OOM。
+  LACT 是 private/share-init strict G4，MARS 使用默认 encoder 288×2/6 heads 和
+  decoder 64×1/1 head。MARS 在整层 scan checkpoint、B1 的首个 forward inner
+  gradient 阶段 OOM：普通 allocator 为 `76.51/78.41 GiB` allocated/reserved，
+  expandable segments 仍在 `77.64/78.41 GiB` OOM，因此不是 allocator 碎片假象；
+  完全关闭 checkpoint 也在 `76.38/78.41 GiB` OOM，默认 MARS 当前无法在 80 GiB
+  H100 上完成 B1 训练 step，不能报告有效 step time。
+- 同一 harness 下 VideoLACT B1 在 compile warmup 后中位 `0.7323 s/step`、
+  `1.366 clips/s`、peak allocated/reserved `5.29/6.05 GiB`；脚本真实 B8 为
+  `1.6276 s/step`、`4.915 clips/s`、`27.27/31.90 GiB`。MARS 在尚未完成 forward
+  时的 allocated 已至少是 LACT B1 完整 step 的 14.7 倍，也是 LACT B8 的 2.85 倍。
+- MARS OOM 还包含 checkpoint 边界问题：即使临时缩到 encoder 64×1/1 head、decoder
+  32×1（82.62M 参数），整层 non-reentrant checkpoint 包住内部 exact
+  `autograd.grad` 时仍在 `77.43/78.42 GiB` OOM；同一缩小模型关闭 checkpoint 可运行，
+  B1 为 `9.7376 s/step`、`0.103 clips/s`、`30.49/31.00 GiB`。这证明当前整层
+  checkpoint 会在 inner gradient 索取 saved tensor 时即时重算完整 scan并放大显存，
+  而默认 288×2 fast Transformer 本身在无 checkpoint 下也超出 80 GiB。后续必须先
+  重设适用于 nested autograd 的 checkpoint 边界，再讨论缩 dim/depth；不能把此次
+  OOM 单纯归因于参数量。
 - Image ViT 初始化：VideoViT、VideoLACT 和 VideoMARS 都已验证 2D patch kernel
   中心膨胀、window QKV/slow MLP 逐值加载及类别头跳过；LACT/MARS-only 参数保持
   新初始化，MARS gate 保持全零。VideoMARS registry 构造和 Middle 参数量也已验证。
