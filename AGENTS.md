@@ -144,12 +144,20 @@
 - reconstruction loss 只用于 `torch.autograd.grad(loss, fast_weights)` 生成当前
   sample 的 fast-state update，绝不能被返回给 engine、加到分类/回归 loss 或作为
   AdamW auxiliary loss。persistent state initializer 和 decoder 只通过当前/后续
-  group 消费更新后 state 所产生的 supervised exact meta-gradient 训练，因此 outer
-  loss 穿过 inner gradient，明确保留二阶梯度。
+  group 消费更新后 state 所产生的 supervised meta-gradient 训练；outer loss 仍穿过
+  raw inner gradient，因此明确保留对 encoder/decoder 的二阶训练信号。
 - reconstruction loss 对全部 fast input/output、Q/K/V/O 和 SwiGLU 矩阵求梯度；
   将方向统一后按矩阵 shape 合批，并默认做 5 次 quintic Newton-Schulz zeroth-power。
   由于这是标准 loss gradient，master weight 沿负 Muon/NS 方向更新。master state
-  保持 FP32，新 fast matrix 沿输入维归一化，并在 CUDA 上转为 BF16。
+  保持 FP32，新 fast matrix 沿输入维归一化，并在 CUDA 上转为 BF16。MARS matrix
+  布局为 `[B,input,output]`，初始化和每次 update 后都必须沿 `dim=1` 归一化；不能
+  误用 LACT `[B,H,input,output]` 布局对应的 `dim=2`。
+- Muon/NS 的前向 update 始终严格执行相同的 5-step quintic 数学；默认 outer backward
+  使用 `normalized_straight_through` surrogate：对每个矩阵用
+  `2 / (||inner_grad|| + 1e-7)` 乘 identity Jacobian，保留 inner-gradient Hessian，
+  但不反传病态的 quintic NS Jacobian。CLI 为 `--mars_muon_backward` 和
+  `--mars_muon_backward_gain`，仍保留 `exact` 与无归一化 `straight_through` 对照；
+  默认 gain 2 是 F64/G8 500-step K400 诊断后选定，不能无验证随意增大。
 - 所有 group 的 shared-encoder 输出拼回完整视频，并在第 32 个 window-ViT block
   之后、最终 `norm_f` 之前通过一个共享 per-channel `memory_gate` 加到主干；gate
   零初始化，使 image checkpoint 初始化时模型函数严格保持 window-ViT baseline。
@@ -422,7 +430,11 @@
   session/launcher PID 为 run name/`1328001`，PID 与日志分别在 run 根目录的
   `train.pid`/`train.log`。step 25--49 稳态约 `1.03--1.09 s/step`，PyTorch peak
   `28,945 MiB`、`nvidia-smi` 每卡约 `34,487 MiB`，grad norm 主要约 3.15--3.20，
-  loss scale 65,536 且没有 OOM/NaN；按稳态纯训练步粗算每 epoch 约 2.2 小时。
+  loss scale 65,536 且没有 OOM/NaN；按稳态纯训练步粗算每 epoch 约 2.2 小时。该 run
+  后续 epoch 0--3 validation top-1 为 `34.05/46.74/51.62/54.78%`，对应 epoch train
+  grad norm 为 `2.75e4/7.13e7/7.62e11/1.23e12`；epoch 4 step 458 时按用户要求停止。
+  根因是 update 后误沿 output dim 归一化以及 exact quintic NS meta-Jacobian 爆炸，
+  因而该 run 科学上无效、所有 rank/GPU 已释放，绝不能 resume 或作为 MARS 能力结论。
 
 ## Weights & Biases 规则
 
@@ -505,9 +517,20 @@
   per-group mask 下，8 个 group 的单次 inner update 均降低当前 pixel reconstruction
   loss，均值从 `1.0242188` 降到 `1.0241969`。同一 batch/mask 连续 20 次 update 后
   loss 从 `1.0237063` 降到 `1.0236323`，其中 13 步严格下降，其余为约 `1e-6` 的 BF16
-  波动。完整 F64/Middle outer backward、gate=0.1 压力测试中 fast encoder、decoder、
+  波动。旧 exact-NS-backward 的完整 F64/Middle outer backward、gate=0.1 压力测试中
+  fast encoder、decoder、
   memory norm 和 gate 的 grad norm 约为 `1256.5/2733.0/35.5/1.07`，所有梯度 finite；
   正式 gate 零初始化时首步仍只打开 gate。
+- VideoMARS：首个正式 K400 run 暴露 exact Muon/NS meta-Jacobian 的后期梯度爆炸后，
+  已对相同 ImageViT 初始化和真实八卡 F64/B8 数据做短程 A/B。仅修正 fast matrix
+  `dim=1` 归一化时，step 500 rolling/累计 grad norm 约 `3.7--4.6/9.81`，只能比原 bug
+  版本的 `7.19/11.38` 略好。无缩放 straight-through 与 normalized-ST gain 1 虽把
+  grad 稳定在约 3.15，却令 decoder/state grad 降到 `1e-8--1e-5`；gain 3 在 step 150
+  产生大 spike，gain `1e4` 在 step 2 直接溢出。最终 normalized-ST gain 2 跑到
+  step 500：rolling/累计 grad norm 为 `2.83/3.98`，step 500 decoder/state encoder/
+  embedding/trunk grad norm 为 `0.412/0.135/0.683/1.489`，PyTorch peak 从 exact 的
+  `28,945 MiB` 降到 `22,692 MiB`。诊断 run 均无 W&B、无 checkpoint，结束后所有
+  tmux/rank/GPU 已释放。
 - VideoMARS/VideoLACT F64 训练 step 对照使用
   `videomamba/video_sm/benchmark_mars_lact.py`：单张 H100、224²、64 帧、G8、BF16、
   drop-path 0.8、label smoothing、AdamW、memory gate 0.1、32 层主干 checkpoint；

@@ -33,6 +33,12 @@ def get_args():
     parser.add_argument("--mars-decoder-dim", type=int, default=64)
     parser.add_argument("--mars-decoder-depth", type=int, default=1)
     parser.add_argument("--mars-decoder-num-heads", type=int, default=1)
+    parser.add_argument(
+        "--mars-muon-backward",
+        choices=("exact", "straight_through", "normalized_straight_through"),
+        default="normalized_straight_through",
+    )
+    parser.add_argument("--mars-muon-backward-gain", type=float, default=2.0)
     return parser.parse_args()
 
 
@@ -69,6 +75,8 @@ def make_model(args):
             mars_decoder_dim=args.mars_decoder_dim,
             mars_decoder_depth=args.mars_decoder_depth,
             mars_decoder_num_heads=args.mars_decoder_num_heads,
+            mars_muon_backward=args.mars_muon_backward,
+            mars_muon_backward_gain=args.mars_muon_backward_gain,
         )
     model = create_model(args.model, **common)
     with torch.no_grad():

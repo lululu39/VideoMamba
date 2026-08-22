@@ -79,6 +79,13 @@ def get_args():
     parser.add_argument('--mars_decoder_depth', type=int, default=1)
     parser.add_argument('--mars_decoder_num_heads', type=int, default=1)
     parser.add_argument('--mars_decoder_mlp_ratio', type=float, default=2.0)
+    parser.add_argument(
+        '--mars_muon_backward',
+        choices=('exact', 'straight_through', 'normalized_straight_through'),
+        default='normalized_straight_through',
+        help='Backward Jacobian for the MARS Muon/NS transform',
+    )
+    parser.add_argument('--mars_muon_backward_gain', type=float, default=2.0)
     share_proj_group = parser.add_mutually_exclusive_group()
     share_proj_group.add_argument(
         '--share_proj', dest='share_proj', action='store_true'
@@ -470,6 +477,8 @@ def main(args, ds_init):
             mars_decoder_depth=args.mars_decoder_depth,
             mars_decoder_num_heads=args.mars_decoder_num_heads,
             mars_decoder_mlp_ratio=args.mars_decoder_mlp_ratio,
+            mars_muon_backward=args.mars_muon_backward,
+            mars_muon_backward_gain=args.mars_muon_backward_gain,
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )

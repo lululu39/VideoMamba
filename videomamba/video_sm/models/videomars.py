@@ -20,6 +20,24 @@ from .videolact import (
 )
 
 
+class _MuonStraightThrough(torch.autograd.Function):
+    """Use the exact Muon value with an identity Jacobian to its input."""
+
+    @staticmethod
+    def forward(ctx, exact_update, raw_gradient, backward_scale):
+        ctx.save_for_backward(backward_scale)
+        ctx.raw_dtype = raw_gradient.dtype
+        return exact_update
+
+    @staticmethod
+    def backward(ctx, output_gradient):
+        (backward_scale,) = ctx.saved_tensors
+        raw_gradient = (output_gradient.float() * backward_scale).to(
+            ctx.raw_dtype
+        )
+        return None, raw_gradient, None
+
+
 def _sincos_position_embedding(length, dim, device=None):
     """Return a non-learned 1D position embedding for the tiny decoder."""
     if length <= 0:
@@ -237,8 +255,28 @@ class FastWeightTransformerEncoder(nn.Module):
             eps=self.norm_epsilon,
         )
 
-    def muon_descent(self, gradients, steps):
+    def muon_descent(
+        self,
+        gradients,
+        steps,
+        backward_mode="exact",
+        backward_gain=1.0,
+    ):
         """Batch same-shaped matrices for LACT-style quintic NS updates."""
+        if backward_mode not in (
+            "exact",
+            "straight_through",
+            "normalized_straight_through",
+        ):
+            raise ValueError(
+                "Muon backward mode must be 'exact', 'straight_through', or "
+                "'normalized_straight_through', "
+                f"got {backward_mode!r}"
+            )
+        if backward_gain <= 0:
+            raise ValueError(
+                f"Muon backward gain must be positive, got {backward_gain}"
+            )
         grouped = {}
         for index, gradient in enumerate(gradients):
             transpose = gradient.shape[-2] > gradient.shape[-1]
@@ -249,10 +287,36 @@ class FastWeightTransformerEncoder(nn.Module):
         updates = [None] * len(gradients)
         for entries in grouped.values():
             oriented = torch.stack([entry[2] for entry in entries])
-            transformed = zeropower_via_newtonschulz5(
-                oriented.flatten(0, 1),
+            oriented_flat = oriented.flatten(0, 1)
+            transformed_flat = zeropower_via_newtonschulz5(
+                oriented_flat,
                 steps,
-            ).reshape_as(oriented)
+            )
+            if backward_mode != "exact":
+                # Preserve the exact Muon/NS forward update while replacing
+                # its ill-conditioned quintic Jacobian with a diagonal
+                # surrogate. The normalized variant retains the detached
+                # scale of Muon's initial matrix normalization.
+                if backward_mode == "normalized_straight_through":
+                    backward_scale = (
+                        oriented_flat.float()
+                        .norm(dim=(-2, -1), keepdim=True)
+                        .add(1e-7)
+                        .reciprocal()
+                        .detach()
+                    )
+                else:
+                    backward_scale = torch.ones_like(
+                        oriented_flat[:, :1, :1],
+                        dtype=torch.float32,
+                    )
+                backward_scale = backward_scale * backward_gain
+                transformed_flat = _MuonStraightThrough.apply(
+                    transformed_flat.detach(),
+                    oriented_flat,
+                    backward_scale,
+                )
+            transformed = transformed_flat.reshape_as(oriented)
             for transformed_weight, (index, transpose, _) in zip(
                 transformed,
                 entries,
@@ -553,6 +617,8 @@ class SharedMARSState(nn.Module):
         decoder_depth=1,
         decoder_num_heads=1,
         decoder_mlp_ratio=2.0,
+        muon_backward_mode="normalized_straight_through",
+        muon_backward_gain=2.0,
         norm_epsilon=1e-5,
         device=None,
         dtype=None,
@@ -568,6 +634,22 @@ class SharedMARSState(nn.Module):
         self.tokens_per_tubelet = int(tokens_per_tubelet)
         self.mask_ratio = float(mask_ratio)
         self.muon_update_steps = int(muon_update_steps)
+        if muon_backward_mode not in (
+            "exact",
+            "straight_through",
+            "normalized_straight_through",
+        ):
+            raise ValueError(
+                "Muon backward mode must be 'exact', 'straight_through', or "
+                "'normalized_straight_through', "
+                f"got {muon_backward_mode!r}"
+            )
+        self.muon_backward_mode = muon_backward_mode
+        if muon_backward_gain <= 0:
+            raise ValueError(
+                f"Muon backward gain must be positive, got {muon_backward_gain}"
+            )
+        self.muon_backward_gain = float(muon_backward_gain)
         self.memory_norm = norm_cls(dim, **factory_kwargs)
         self.state_encoder = FastWeightTransformerEncoder(
             input_dim=dim,
@@ -692,6 +774,8 @@ class SharedMARSState(nn.Module):
             updates = self.state_encoder.muon_descent(
                 gradients,
                 self.muon_update_steps,
+                backward_mode=self.muon_backward_mode,
+                backward_gain=self.muon_backward_gain,
             )
             master_weights = tuple(
                 master - update.to(master.dtype)
@@ -699,7 +783,10 @@ class SharedMARSState(nn.Module):
             )
             fast_dtype = differentiable_fast_weights[0].dtype
             fast_weights = tuple(
-                F.normalize(master, dim=2, eps=1e-5).to(fast_dtype)
+                # MARS stores every matrix as [batch, input, output], unlike
+                # LACT's [batch, head, input, output] layout.  Keep the input
+                # dimension normalized before and after every state update.
+                F.normalize(master, dim=1, eps=1e-5).to(fast_dtype)
                 for master in master_weights
             )
         return fast_weights, master_weights
@@ -793,6 +880,8 @@ class VisionMARS(nn.Module):
         mars_decoder_depth=1,
         mars_decoder_num_heads=1,
         mars_decoder_mlp_ratio=2.0,
+        mars_muon_backward="normalized_straight_through",
+        mars_muon_backward_gain=2.0,
         device=None,
         dtype=None,
         use_checkpoint=False,
@@ -899,6 +988,8 @@ class VisionMARS(nn.Module):
             decoder_depth=mars_decoder_depth,
             decoder_num_heads=mars_decoder_num_heads,
             decoder_mlp_ratio=mars_decoder_mlp_ratio,
+            muon_backward_mode=mars_muon_backward,
+            muon_backward_gain=mars_muon_backward_gain,
             norm_epsilon=norm_epsilon,
             **factory_kwargs,
         )

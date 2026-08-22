@@ -26,12 +26,46 @@ def get_loss_scale_for_deepspeed(model):
         return 0
 
 
+def _mars_grad_group_norms(model):
+    """Return subsystem L2 grad norms for opt-in MARS diagnostics."""
+    squared_norms = {}
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        name = name.removeprefix("module.")
+        if name.startswith("shared_state.state_encoder"):
+            group = "state_encoder"
+        elif name.startswith("shared_state.decoder"):
+            group = "decoder"
+        elif name == "shared_state.memory_norm.weight":
+            group = "memory_norm"
+        elif name == "shared_state.memory_gate":
+            group = "memory_gate"
+        elif name.startswith("layers."):
+            group = "vit_trunk"
+        elif name.startswith(
+            ("patch_embed.", "cls_token", "pos_embed", "temporal_pos_embedding")
+        ):
+            group = "embedding"
+        elif name.startswith(("norm_f.", "head.")):
+            group = "head_and_final_norm"
+        else:
+            group = "other"
+        squared = parameter.grad.detach().float().square().sum()
+        squared_norms[group] = squared_norms.get(group, 0.0) + squared
+    return {
+        group: squared.sqrt().item()
+        for group, squared in sorted(squared_norms.items())
+    }
+
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, amp_autocast, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None, log_writer=None,
                     start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
-                    num_training_steps_per_epoch=None, update_freq=None, no_amp=False, bf16=False):
+                    num_training_steps_per_epoch=None, update_freq=None, no_amp=False, bf16=False,
+                    diagnostic_grad_groups_freq=0):
     model.train(True)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -111,6 +145,21 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                                         parameters=model.parameters(), create_graph=is_second_order,
                                         update_grad=(data_iter_step + 1) % update_freq == 0)
                 if (data_iter_step + 1) % update_freq == 0:
+                    if (
+                        diagnostic_grad_groups_freq > 0
+                        and (it == 0 or (it + 1) % diagnostic_grad_groups_freq == 0)
+                        and utils.is_main_process()
+                    ):
+                        grad_groups = _mars_grad_group_norms(model)
+                        print(
+                            "MARS_GRAD_GROUPS "
+                            f"global_step={it} "
+                            + " ".join(
+                                f"{name}={value:.8g}"
+                                for name, value in grad_groups.items()
+                            ),
+                            flush=True,
+                        )
                     optimizer.zero_grad()
                     if model_ema is not None:
                         model_ema.update(model)

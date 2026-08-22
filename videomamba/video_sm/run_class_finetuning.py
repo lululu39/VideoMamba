@@ -81,6 +81,13 @@ def get_args():
     parser.add_argument('--mars_decoder_depth', type=int, default=1)
     parser.add_argument('--mars_decoder_num_heads', type=int, default=1)
     parser.add_argument('--mars_decoder_mlp_ratio', type=float, default=2.0)
+    parser.add_argument(
+        '--mars_muon_backward',
+        choices=('exact', 'straight_through', 'normalized_straight_through'),
+        default='normalized_straight_through',
+        help='Backward Jacobian for the MARS Muon/NS transform',
+    )
+    parser.add_argument('--mars_muon_backward_gain', type=float, default=2.0)
     share_proj_group = parser.add_mutually_exclusive_group()
     share_proj_group.add_argument(
         '--share_proj', dest='share_proj', action='store_true'
@@ -113,6 +120,15 @@ def get_args():
                         help='Optimizer Betas (default: None, use opt default)')
     parser.add_argument('--clip_grad', type=float, default=None, metavar='NORM',
                         help='Clip gradient norm (default: None, no clipping)')
+    parser.add_argument(
+        '--diagnostic_grad_groups_freq',
+        type=int,
+        default=0,
+        help=(
+            'Print MARS subsystem gradient norms every N optimizer steps; '
+            '0 disables this diagnostic'
+        ),
+    )
     parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
                         help='SGD momentum (default: 0.9)')
     parser.add_argument('--weight_decay', type=float, default=0.05,
@@ -480,6 +496,8 @@ def main(args, ds_init):
             mars_decoder_depth=args.mars_decoder_depth,
             mars_decoder_num_heads=args.mars_decoder_num_heads,
             mars_decoder_mlp_ratio=args.mars_decoder_mlp_ratio,
+            mars_muon_backward=args.mars_muon_backward,
+            mars_muon_backward_gain=args.mars_muon_backward_gain,
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )
@@ -776,7 +794,8 @@ def main(args, ds_init):
             log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-            no_amp=args.no_amp, bf16=args.bf16
+            no_amp=args.no_amp, bf16=args.bf16,
+            diagnostic_grad_groups_freq=args.diagnostic_grad_groups_freq,
         )
         if args.output_dir and args.save_ckpt:
             # if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
