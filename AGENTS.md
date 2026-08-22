@@ -403,7 +403,7 @@
   VideoMARS；epoch 0--7 validation top-1 为 34.38/58.63/65.69/69.96/72.15/
   73.94/75.07/75.81%，latest/best checkpoint 均保留。training/guard tmux、launcher、
   8 个 rank 和 guard 均已退出，8 张 GPU 回到约 4 MiB/0%，不得自动恢复该 run。
-- 已删除的 shared-pixel-MAE VideoMARS-Middle 历史首个 K400 F64 run 脚本为
+- 已删除的 shared-pixel-MAE VideoMARS-Middle 历史首个 K400 F64 run 脚本曾为
   `videomamba/video_sm/exp/k400/videomars_middle/run_f64x224_no_ld_v1.sh`，run name 为
   `video-mars-middle-k400-f64x224-no-ld-v1`。它沿用 LACT F64/no-LD recipe 的 64 帧、
   每卡 batch 4、`num_sample=2`、10 epochs、1 epoch warmup、base LR `2e-4`、drop path
@@ -420,8 +420,17 @@
   grad norm 为 `2.75e4/7.13e7/7.62e11/1.23e12`；epoch 4 step 458 时按用户要求停止。
   根因是 update 后误沿 output dim 归一化以及 exact quintic NS meta-Jacobian 爆炸，
   因而该 run 科学上无效、所有 rank/GPU 已释放，绝不能 resume 或作为 MARS 能力结论。
-  该 v1 脚本现会立即报错退出，防止旧 W&B/run name 被新逐层 MARS 意外复用；启动新
-  MARS 实验必须按用户明确提供的新 run name 另建脚本。
+  该 v1 脚本已从仓库删除，防止旧 W&B/run name 被新逐层 MARS 意外复用。
+- 当前逐层 hidden-reconstruction VideoMARS-Middle K400 F64 run 脚本为
+  `videomamba/video_sm/exp/k400/videomars_middle/run_f64x224_no_ld_v2.sh`，run name 为
+  `video-mars-middle-k400-f64x224-no-ld-v2`。它沿用相同 F64/no-LD 10-epoch recipe，
+  MARS 显式固定 G8、`fw_inter_multi=2`、1 FW head、base LR 0.01、mask ratio 0.5 和
+  exact 5-step Muon/NS；ImageViT 初始化后总参数 114,238,480。公网 W&B run 为
+  `https://wandb.ai/LVSM-Experiment/videosft/runs/3oe7io4x`；2026-08-22 启动，tmux
+  session/launcher PID 为 run name/`1213826`，PID 与日志分别位于 run 根目录的
+  `train.pid`/`train.log`。首个 compiled step 为 43.68 秒；step 20--29 的 20-step
+  rolling time 为 `2.40--2.57 s/step`，PyTorch peak `15,917 MiB`、`nvidia-smi`
+  每卡约 `18.5--18.7 GiB`，grad norm 约 3.10--3.13，loss scale 65,536，无 OOM/NaN。
 
 ## Weights & Biases 规则
 
