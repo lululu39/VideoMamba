@@ -354,7 +354,8 @@ class TinyMaskedDecoder(nn.Module):
 
     def __init__(
         self,
-        input_dim,
+        encoder_output_dim,
+        prediction_dim,
         decoder_dim,
         num_heads,
         max_chunk_size,
@@ -374,7 +375,7 @@ class TinyMaskedDecoder(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.decoder_dim = decoder_dim
         self.encoder_to_decoder = nn.Linear(
-            input_dim,
+            encoder_output_dim,
             decoder_dim,
             bias=False,
             **factory_kwargs,
@@ -401,7 +402,7 @@ class TinyMaskedDecoder(nn.Module):
         )
         self.predict = nn.Linear(
             decoder_dim,
-            input_dim,
+            prediction_dim,
             **factory_kwargs,
         )
         self.register_buffer(
@@ -439,51 +440,26 @@ class TinyMaskedDecoder(nn.Module):
         return self.predict(self.norm_out(tokens))
 
 
-class MARSBlock(nn.Module):
-    """Window attention plus masked-autoencoding recurrent fast state."""
+class MARSWindowBlock(nn.Module):
+    """VideoViT block whose attention is restricted to temporal windows."""
 
     def __init__(
         self,
         dim,
         num_heads,
         norm_cls,
-        tokens_per_tubelet,
-        max_chunk_size,
-        layer_index,
         drop_path=0.0,
         attn_drop=0.0,
         proj_drop=0.0,
         qkv_bias=True,
         mlp_ratio=3.0,
         residual_in_fp32=True,
-        fw_inter_multi=2,
-        encoder_dim=64,
-        encoder_depth=1,
-        encoder_num_heads=1,
-        muon_update_steps=5,
-        mask_ratio=0.5,
-        decoder_dim=32,
-        decoder_depth=1,
-        decoder_num_heads=1,
-        decoder_mlp_ratio=2.0,
-        norm_epsilon=1e-5,
         device=None,
         dtype=None,
     ):
         super().__init__()
-        if not 0.0 < mask_ratio < 1.0:
-            raise ValueError(f"mask_ratio must be in (0, 1), got {mask_ratio}")
-        if muon_update_steps < 0:
-            raise ValueError(
-                f"muon_update_steps must be non-negative, got {muon_update_steps}"
-            )
         factory_kwargs = {"device": device, "dtype": dtype}
-        self.tokens_per_tubelet = int(tokens_per_tubelet)
-        self.layer_index = int(layer_index)
-        self.mask_ratio = float(mask_ratio)
-        self.muon_update_steps = int(muon_update_steps)
         self.residual_in_fp32 = residual_in_fp32
-
         # These names intentionally match image/video VideoViT checkpoints.
         self.norm = norm_cls(dim, **factory_kwargs)
         self.mixer = SoftmaxAttention(
@@ -497,27 +473,6 @@ class MARSBlock(nn.Module):
         self.drop_path = (
             TensorDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
-        self.memory_norm = norm_cls(dim, **factory_kwargs)
-        self.state_encoder = FastWeightTransformerEncoder(
-            input_dim=dim,
-            encoder_dim=encoder_dim,
-            depth=encoder_depth,
-            num_heads=encoder_num_heads,
-            inter_multi=fw_inter_multi,
-            norm_epsilon=norm_epsilon,
-            **factory_kwargs,
-        )
-        self.decoder = TinyMaskedDecoder(
-            dim,
-            decoder_dim=decoder_dim,
-            num_heads=decoder_num_heads,
-            max_chunk_size=max_chunk_size,
-            depth=decoder_depth,
-            mlp_ratio=decoder_mlp_ratio,
-            norm_epsilon=norm_epsilon,
-            **factory_kwargs,
-        )
-        self.memory_gate = nn.Parameter(torch.zeros(dim, **factory_kwargs))
         self.norm_mlp = norm_cls(dim, **factory_kwargs)
         self.mlp = SwiGLUMLP(dim, mlp_ratio=mlp_ratio, **factory_kwargs)
 
@@ -551,23 +506,90 @@ class MARSBlock(nn.Module):
             outputs.append(tail.reshape(batch_size, tail_count, seq_len, dim))
         return torch.cat(outputs, dim=1)
 
-    def _apply_memory_mlp_chunk(self, x, fast_weights):
-        batch_size, group_size, seq_len, dim = x.shape
-        flat_x = x.reshape(batch_size, group_size * seq_len, dim)
-        memory_input = self.memory_norm(
-            flat_x.to(dtype=self.memory_norm.weight.dtype)
+    def _forward_block(self, x, window_group_size):
+        x = self._apply_window_attention(x, window_group_size)
+        batch_size, tubelets, seq_len, dim = x.shape
+        flat_x = x.reshape(batch_size * tubelets, seq_len, dim)
+        flat_x = flat_x + self.drop_path(
+            self.mlp(
+                self.norm_mlp(flat_x.to(dtype=self.norm_mlp.weight.dtype))
+            )
         )
-        memory_output = self.state_encoder(memory_input, fast_weights)
-        memory_output = memory_output * self.memory_gate
-        x = x + self.drop_path(memory_output).reshape_as(x)
-        flat_group_x = x.reshape(batch_size * group_size, seq_len, dim)
-        slow_output = self.mlp(
-            self.norm_mlp(flat_group_x.to(dtype=self.norm_mlp.weight.dtype))
+        x = flat_x.reshape(batch_size, tubelets, seq_len, dim)
+        return x.float() if self.residual_in_fp32 else x
+
+    def forward(self, x, window_group_size, use_checkpoint=False):
+        if not use_checkpoint:
+            return self._forward_block(x, window_group_size)
+
+        def checkpointed_block(layer_input):
+            return self._forward_block(layer_input, window_group_size)
+
+        return checkpoint.checkpoint(
+            checkpointed_block,
+            x,
+            preserve_rng_state=True,
+            use_reentrant=False,
         )
-        x = x + self.drop_path(slow_output).reshape_as(x)
-        if self.residual_in_fp32:
-            x = x.float()
-        return x, memory_input
+
+
+class SharedMARSState(nn.Module):
+    """One model-wide recurrent state trained by masked pixel reconstruction."""
+
+    def __init__(
+        self,
+        dim,
+        pixel_dim,
+        norm_cls,
+        tokens_per_tubelet,
+        max_chunk_size,
+        fw_inter_multi=2,
+        encoder_dim=64,
+        encoder_depth=1,
+        encoder_num_heads=1,
+        muon_update_steps=5,
+        mask_ratio=0.5,
+        decoder_dim=32,
+        decoder_depth=1,
+        decoder_num_heads=1,
+        decoder_mlp_ratio=2.0,
+        norm_epsilon=1e-5,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        if not 0.0 < mask_ratio < 1.0:
+            raise ValueError(f"mask_ratio must be in (0, 1), got {mask_ratio}")
+        if muon_update_steps < 0:
+            raise ValueError(
+                f"muon_update_steps must be non-negative, got {muon_update_steps}"
+            )
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.tokens_per_tubelet = int(tokens_per_tubelet)
+        self.mask_ratio = float(mask_ratio)
+        self.muon_update_steps = int(muon_update_steps)
+        self.memory_norm = norm_cls(dim, **factory_kwargs)
+        self.state_encoder = FastWeightTransformerEncoder(
+            input_dim=dim,
+            encoder_dim=encoder_dim,
+            depth=encoder_depth,
+            num_heads=encoder_num_heads,
+            inter_multi=fw_inter_multi,
+            norm_epsilon=norm_epsilon,
+            **factory_kwargs,
+        )
+        self.decoder = TinyMaskedDecoder(
+            encoder_output_dim=dim,
+            prediction_dim=pixel_dim,
+            decoder_dim=decoder_dim,
+            num_heads=decoder_num_heads,
+            max_chunk_size=max_chunk_size,
+            depth=decoder_depth,
+            mlp_ratio=decoder_mlp_ratio,
+            norm_epsilon=norm_epsilon,
+            **factory_kwargs,
+        )
+        self.memory_gate = nn.Parameter(torch.zeros(dim, **factory_kwargs))
 
     @staticmethod
     def _gather_tokens(x, indices):
@@ -594,12 +616,8 @@ class MARSBlock(nn.Module):
             masked_local = scores.argsort(dim=1)[:, :mask_count]
         else:
             local_indices = torch.arange(patch_count, device=device)
-            # A deterministic modular hash gives every layer/chunk a stable
-            # pseudo-random mask without consuming evaluation RNG state.
             scores = (
-                local_indices * 1103515245
-                + (update_index + 1) * 12345
-                + (self.layer_index + 1) * 2654435761
+                local_indices * 1103515245 + (update_index + 1) * 12345
             ).remainder(2147483647)
             masked_local = scores.argsort()[:mask_count]
             masked_local = masked_local.unsqueeze(0).expand(batch_size, -1)
@@ -619,6 +637,7 @@ class MARSBlock(nn.Module):
     def _reconstruction_gradients(
         self,
         memory_input,
+        pixel_targets,
         fast_weights,
         update_index,
         create_graph,
@@ -634,10 +653,10 @@ class MARSBlock(nn.Module):
         visible_latents = self.state_encoder(visible_input, fast_weights)
         prediction = self.decoder(visible_latents, visible_indices, seq_len)
         prediction = self._gather_tokens(prediction, masked_indices).float()
-        # The target is the current normalized hidden state itself. It is a
-        # stop-gradient reconstruction target, not an EMA/teacher feature.
-        target = memory_input.detach().float()
-        target = self._gather_tokens(target, masked_indices)
+        target = self._gather_tokens(
+            pixel_targets.detach(),
+            masked_indices,
+        ).float()
         reconstruction_loss = (prediction - target).square().mean(dim=(1, 2))
         return torch.autograd.grad(
             reconstruction_loss.sum(),
@@ -649,6 +668,7 @@ class MARSBlock(nn.Module):
     def _update_state(
         self,
         memory_input,
+        pixel_targets,
         fast_weights,
         master_weights,
         update_index,
@@ -664,6 +684,7 @@ class MARSBlock(nn.Module):
             )
             gradients = self._reconstruction_gradients(
                 memory_input,
+                pixel_targets,
                 differentiable_fast_weights,
                 update_index,
                 create_graph=create_graph,
@@ -683,45 +704,58 @@ class MARSBlock(nn.Module):
             )
         return fast_weights, master_weights
 
-    def _forward_scan(self, x, fw_update_group_size):
-        """Strict apply-then-update scan over one complete MARS layer."""
-        batch_size, tubelets, _, _ = x.shape
-        x = self._apply_window_attention(x, fw_update_group_size)
+    def forward(self, x, pixel_targets, fw_update_group_size):
+        """For every group, update from masked pixels and then apply state."""
+        batch_size, tubelets, seq_len, dim = x.shape
+        patch_count = seq_len - 1
+        if pixel_targets.shape[:3] != (batch_size, tubelets, patch_count):
+            raise ValueError(
+                "Pixel target shape does not match embedded video: "
+                f"{tuple(pixel_targets.shape)} versus "
+                f"({batch_size}, {tubelets}, {patch_count}, pixel_dim)"
+            )
         fast_weights, master_weights = self.state_encoder.init_state(batch_size)
         outputs = []
         update_index = 0
         for group_start in range(0, tubelets, fw_update_group_size):
             group_end = min(group_start + fw_update_group_size, tubelets)
-            chunk_output, memory_input = self._apply_memory_mlp_chunk(
-                x[:, group_start:group_end],
-                fast_weights,
+            group_size = group_end - group_start
+            memory_input = self.memory_norm(
+                x[:, group_start:group_end]
+                .reshape(batch_size, group_size * seq_len, dim)
+                .to(dtype=self.memory_norm.weight.dtype)
             )
-            # The current group is always encoded with the old state. The
-            # reconstruction update becomes visible only to a later group.
-            if group_end < tubelets:
-                fast_weights, master_weights = self._update_state(
-                    memory_input,
-                    fast_weights,
-                    master_weights,
-                    update_index,
+            group_pixels = pixel_targets[:, group_start:group_end]
+            target_tokens = group_pixels.new_zeros(
+                batch_size,
+                group_size,
+                seq_len,
+                group_pixels.shape[-1],
+            )
+            target_tokens[:, :, 1:] = group_pixels
+            target_tokens = target_tokens.reshape(
+                batch_size,
+                group_size * seq_len,
+                group_pixels.shape[-1],
+            )
+            fast_weights, master_weights = self._update_state(
+                memory_input,
+                target_tokens,
+                fast_weights,
+                master_weights,
+                update_index,
+            )
+            outputs.append(
+                self.state_encoder(memory_input, fast_weights).reshape(
+                    batch_size,
+                    group_size,
+                    seq_len,
+                    dim,
                 )
-                update_index += 1
-            outputs.append(chunk_output)
-        return torch.cat(outputs, dim=1)
-
-    def forward_scan(self, x, fw_update_group_size, use_checkpoint=False):
-        if not use_checkpoint:
-            return self._forward_scan(x, fw_update_group_size)
-
-        def checkpointed_scan(layer_input):
-            return self._forward_scan(layer_input, fw_update_group_size)
-
-        return checkpoint.checkpoint(
-            checkpointed_scan,
-            x,
-            preserve_rng_state=True,
-            use_reentrant=False,
-        )
+            )
+            update_index += 1
+        memory_output = torch.cat(outputs, dim=1)
+        return memory_output * self.memory_gate
 
 
 class VisionMARS(nn.Module):
@@ -791,6 +825,8 @@ class VisionMARS(nn.Module):
         self.mars_encoder_depth = mars_encoder_depth
         self.mars_encoder_num_heads = mars_encoder_num_heads
         self.mars_decoder_depth = mars_decoder_depth
+        self.channels = int(channels)
+        self.tubelet_size = int(kernel_size)
         self.patch_embed = PatchEmbed(
             img_size=img_size,
             patch_size=patch_size,
@@ -803,6 +839,10 @@ class VisionMARS(nn.Module):
         self.fw_update_group_size = int(fw_update_group_size)
         self.chunk_size = self.tokens_per_tubelet * self.fw_update_group_size
         self.window_size = self.chunk_size
+        patch_height, patch_width = self.patch_embed.patch_size
+        self.pixel_dim = (
+            self.channels * self.tubelet_size * patch_height * patch_width
+        )
         self.cls_token = nn.Parameter(
             torch.zeros(1, 1, embed_dim, **factory_kwargs)
         )
@@ -828,34 +868,39 @@ class VisionMARS(nn.Module):
         inter_dpr = [0.0] + dpr
         self.layers = nn.ModuleList(
             [
-                MARSBlock(
+                MARSWindowBlock(
                     embed_dim,
                     num_heads=num_heads,
                     norm_cls=norm_cls,
-                    tokens_per_tubelet=self.tokens_per_tubelet,
-                    max_chunk_size=self.chunk_size,
-                    layer_index=index,
                     drop_path=inter_dpr[index],
                     attn_drop=attn_drop_rate,
                     proj_drop=drop_rate,
                     qkv_bias=qkv_bias,
                     mlp_ratio=mlp_ratio,
                     residual_in_fp32=residual_in_fp32,
-                    fw_inter_multi=fw_inter_multi,
-                    encoder_dim=mars_encoder_dim,
-                    encoder_depth=mars_encoder_depth,
-                    encoder_num_heads=mars_encoder_num_heads,
-                    muon_update_steps=muon_update_steps,
-                    mask_ratio=mars_mask_ratio,
-                    decoder_dim=mars_decoder_dim,
-                    decoder_depth=mars_decoder_depth,
-                    decoder_num_heads=mars_decoder_num_heads,
-                    decoder_mlp_ratio=mars_decoder_mlp_ratio,
-                    norm_epsilon=norm_epsilon,
                     **factory_kwargs,
                 )
                 for index in range(depth)
             ]
+        )
+        self.shared_state = SharedMARSState(
+            dim=embed_dim,
+            pixel_dim=self.pixel_dim,
+            norm_cls=norm_cls,
+            tokens_per_tubelet=self.tokens_per_tubelet,
+            max_chunk_size=self.chunk_size,
+            fw_inter_multi=fw_inter_multi,
+            encoder_dim=mars_encoder_dim,
+            encoder_depth=mars_encoder_depth,
+            encoder_num_heads=mars_encoder_num_heads,
+            muon_update_steps=muon_update_steps,
+            mask_ratio=mars_mask_ratio,
+            decoder_dim=mars_decoder_dim,
+            decoder_depth=mars_decoder_depth,
+            decoder_num_heads=mars_decoder_num_heads,
+            decoder_mlp_ratio=mars_decoder_mlp_ratio,
+            norm_epsilon=norm_epsilon,
+            **factory_kwargs,
         )
         self.norm_f = norm_cls(embed_dim, **factory_kwargs)
 
@@ -868,11 +913,9 @@ class VisionMARS(nn.Module):
                 **(initializer_cfg if initializer_cfg is not None else {}),
             )
         )
-        # Preserve the image VideoViT function while the MARS branch learns
-        # to open. Decoder parameters remain trainable through meta-gradients
-        # once later chunks consume an updated state.
-        for layer in self.layers:
-            nn.init.zeros_(layer.memory_gate)
+        # Preserve the image VideoViT function while the shared MARS branch
+        # learns to open through the supervised outer objective.
+        nn.init.zeros_(self.shared_state.memory_gate)
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -885,7 +928,49 @@ class VisionMARS(nn.Module):
     def get_num_layers(self):
         return len(self.layers)
 
+    def patchify_pixels(self, video):
+        """Convert video into targets aligned with PatchEmbed's tubelets."""
+        batch_size, channels, frames, height, width = video.shape
+        patch_height, patch_width = self.patch_embed.patch_size
+        if channels != self.channels:
+            raise ValueError(
+                f"Input channels {channels} do not match model {self.channels}"
+            )
+        if frames % self.tubelet_size != 0:
+            raise ValueError(
+                f"Input frames {frames} are not divisible by tubelet size "
+                f"{self.tubelet_size}"
+            )
+        if height % patch_height != 0 or width % patch_width != 0:
+            raise ValueError(
+                f"Input size ({height}, {width}) is not divisible by patch "
+                f"size ({patch_height}, {patch_width})"
+            )
+        tubelets = frames // self.tubelet_size
+        grid_height = height // patch_height
+        grid_width = width // patch_width
+        return (
+            video.reshape(
+                batch_size,
+                channels,
+                tubelets,
+                self.tubelet_size,
+                grid_height,
+                patch_height,
+                grid_width,
+                patch_width,
+            )
+            .permute(0, 2, 4, 6, 3, 5, 7, 1)
+            .reshape(
+                batch_size,
+                tubelets,
+                grid_height * grid_width,
+                self.pixel_dim,
+            )
+        )
+
     def forward_features(self, x):
+        pixel_targets = self.patchify_pixels(x)
         x = self.patch_embed(x)
         batch_size, channels, tubelets, height, width = x.shape
         if tubelets != self.temporal_pos_embedding.shape[1]:
@@ -904,15 +989,21 @@ class VisionMARS(nn.Module):
         x = x + self.pos_embed.unsqueeze(1)
         x = x + self.temporal_pos_embedding.unsqueeze(2)
         x = self.pos_drop(x)
+        state_output = self.shared_state(
+            x,
+            pixel_targets,
+            self.fw_update_group_size,
+        )
 
         for index, layer in enumerate(self.layers):
-            x = layer.forward_scan(
+            x = layer(
                 x,
                 self.fw_update_group_size,
                 use_checkpoint=(
                     self.use_checkpoint and index < self.checkpoint_num
                 ),
             )
+        x = x + state_output
         x = self.norm_f(x.to(dtype=self.norm_f.weight.dtype))
         return x[:, -1, 0]
 

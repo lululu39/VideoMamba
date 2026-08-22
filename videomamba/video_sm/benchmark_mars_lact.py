@@ -72,6 +72,8 @@ def make_model(args):
         )
     model = create_model(args.model, **common)
     with torch.no_grad():
+        if getattr(model, "shared_state", None) is not None:
+            model.shared_state.memory_gate.fill_(args.memory_gate)
         for layer in model.layers:
             if getattr(layer, "memory_gate", None) is not None:
                 layer.memory_gate.fill_(args.memory_gate)
