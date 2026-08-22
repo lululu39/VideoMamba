@@ -122,8 +122,9 @@
 - 整个模型只维护一个 per-sample shared fast Transformer state，位于根模块
   `shared_state`，不随 32 个主干 block 复制。encoder 含 fast
   `input_proj/output_proj`，每层含显式 self-attention `wq/wk/wv/wo` 和 fast SwiGLU
-  `w0/w1/w2`；RMSNorm 无 affine，不属于 fast state。默认 encoder 为 64 dim、
-  1 layer、1 head，fast SwiGLU `fw_inter_multi=2`；这些大小仍可由 CLI 配置。
+  `w0/w1/w2`；RMSNorm 无 affine，不属于 fast state。默认 encoder dim 是主干 dim 的
+  `2/3`、depth 2、1 head，Middle 即 288 dim；fast SwiGLU `fw_inter_multi=2`。
+  这些大小仍可由 CLI 配置。
 - shared state 使用 update-then-apply：每个 temporal group 先从 masked-pixel MAE loss
   更新 state，再用更新后的 encoder 编码该 group 的完整 token。因此最后一个 group
   的 update 也会被当前 group 消费；F64/G8 总共只做 8 次 model-wide update，而被
@@ -137,7 +138,7 @@
   使用只由 group index 决定的 deterministic mask，不消耗 evaluation RNG。
 - masked visible token 经过当前 fast Transformer encoder 后进入 tiny Transformer
   decoder；全模型只共享这一个 decoder。decoder 的默认配置为
-  32 dim、1 layer、1 head、ratio-2 MLP，固定 1D sin-cos position embedding 不持久化。
+  64 dim、1 layer、1 head、ratio-2 MLP，固定 1D sin-cos position embedding 不持久化。
   fast encoder 与 decoder 的 inner attention 都使用支持二阶梯度的显式 softmax；
   主干 window attention 继续使用高效 SDPA。
 - reconstruction loss 只用于 `torch.autograd.grad(loss, fast_weights)` 生成当前
@@ -158,9 +159,10 @@
   shared recurrent scan 在这些 checkpoint 外只执行一次，避免旧 per-layer 原型把
   nested `autograd.grad` 包进整层 checkpoint 所导致的即时重算与 OOM。
 - Middle 默认 `dim=432`、depth 32、9 window-attention heads；64 帧/G8/400 类时
-  总参数 78,482,384；唯一 shared state 合计 144,832，其中 fast Transformer
-  96,256、pixel decoder 47,712、memory norm/gate 864。32 个主干 block 中不存在
-  `state_encoder` 或 decoder。
+  总参数 80,357,168；唯一 shared state 合计 2,019,616，其中 fast Transformer
+  1,907,712、pixel decoder 111,040、memory norm/gate 864。该规模按 H100 B8
+  显存与 private VideoLACT 对齐后选定；32 个主干 block 中仍不存在 `state_encoder`
+  或 decoder。
 
 ## LACT 参考实现与 chunk/update 结论
 
@@ -486,19 +488,26 @@
   target 与 Conv3d tubelet/空间 patch 顺序对齐。G1 window 下只修改早期 frame、保持
   最后 frame 不变时，gate=0 的分类输出最大差严格为 0；gate 打开后最大差约 0.180，
   确认跨 group 信息只通过唯一 shared recurrent state 传递。
+- VideoMARS：默认 288×2 shared encoder 在真实 F64/G8 token/pixel shape、B2、固定
+  per-group mask 下，8 个 group 的单次 inner update 均降低当前 pixel reconstruction
+  loss，均值从 `1.0242188` 降到 `1.0241969`。同一 batch/mask 连续 20 次 update 后
+  loss 从 `1.0237063` 降到 `1.0236323`，其中 13 步严格下降，其余为约 `1e-6` 的 BF16
+  波动。完整 F64/Middle outer backward、gate=0.1 压力测试中 fast encoder、decoder、
+  memory norm 和 gate 的 grad norm 约为 `1256.5/2733.0/35.5/1.07`，所有梯度 finite；
+  正式 gate 零初始化时首步仍只打开 gate。
 - VideoMARS/VideoLACT F64 训练 step 对照使用
   `videomamba/video_sm/benchmark_mars_lact.py`：单张 H100、224²、64 帧、G8、BF16、
   drop-path 0.8、label smoothing、AdamW、memory gate 0.1、32 层主干 checkpoint；
-  完成 warmup 的 peak 包含 optimizer state。当前 shared-pixel-MAE MARS 的 B1
-  （1 warmup/2 measure）为 `0.3060 s/step`、`3.268 clips/s`、allocated/reserved
-  `2.65/2.83 GiB`；脚本真实 B8（2 warmup/3 measure）为 `0.6732 s/step`、
-  `11.883 clips/s`、`14.50/15.13 GiB`。
+  完成 warmup 的 peak 包含 optimizer state。最初轻量的 64×1 encoder/32×1 decoder
+  在 B8 为 `0.6732 s/step`、`14.50 GiB`。为对齐 LACT 显存预算，正式默认扩大到
+  288×2 encoder/64×1 decoder；脚本真实 B8（2 warmup/3 measure）为
+  `0.7455 s/step`、`10.731 clips/s`、allocated/reserved `27.41/28.13 GiB`。
 - 同一 harness 下 private/share-init strict-G4 VideoLACT B8 为 `1.6276 s/step`、
-  `4.915 clips/s`、`27.27/31.90 GiB`；shared MARS 的 B8 吞吐约为其 2.42 倍，
-  allocated peak 低约 46.8%。被删除的 per-layer hidden-reconstruction MARS 即使缩到
+  `4.915 clips/s`、`27.27/31.90 GiB`；正式 shared MARS 的 allocated peak 只高约
+  0.5%，但吞吐仍约为其 2.18 倍。被删除的 per-layer hidden-reconstruction MARS 即使缩到
   encoder 64×1、decoder 32×1，B1 仍为 `9.7534 s/step`、`29.73 GiB`；改为唯一
-  shared pixel-MAE state 后，同为 B1 的 step time 下降约 31.9 倍、allocated peak
-  下降约 11.2 倍。
+  64×1 shared pixel-MAE prototype 后，同为 B1 的 step time 下降约 31.9 倍、
+  allocated peak 下降约 11.2 倍。
 - Image ViT 初始化：VideoViT、VideoLACT 和 VideoMARS 都已验证 2D patch kernel
   中心膨胀、window QKV/slow MLP 逐值加载及类别头跳过；LACT/MARS-only 参数保持
   新初始化，MARS gate 保持全零。VideoMARS registry 构造和 Middle 参数量也已验证。
