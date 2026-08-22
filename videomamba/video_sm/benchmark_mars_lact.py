@@ -22,7 +22,13 @@ def get_args():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-frames", type=int, default=64)
     parser.add_argument("--fw-update-group-size", type=int, default=8)
-    parser.add_argument("--lact-layer-group-size", type=int, default=4)
+    parser.add_argument(
+        "--layer-group-size",
+        "--lact-layer-group-size",
+        dest="layer_group_size",
+        type=int,
+        default=4,
+    )
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--measure-steps", type=int, default=5)
     parser.add_argument("--memory-gate", type=float, default=0.1)
@@ -51,9 +57,15 @@ def make_model(args):
         common.update(
             fw_num_heads=1,
             fw_base_lr=0.01,
-            fw_update_layer_group_size=args.lact_layer_group_size,
+            fw_update_layer_group_size=args.layer_group_size,
             share_proj=False,
             share_init=True,
+        )
+    else:
+        common.update(
+            fw_num_heads=1,
+            fw_base_lr=0.01,
+            fw_update_layer_group_size=args.layer_group_size,
         )
     model = create_model(args.model, **common)
     with torch.no_grad():

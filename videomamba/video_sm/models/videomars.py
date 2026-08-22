@@ -121,21 +121,42 @@ class MaskedFastWeightAutoencoder(FastWeightSwiGLU):
         d_up = d_hidden * F.silu(gate)
         d_gate = self._silu_backward(d_hidden * up, gate)
         lr0, lr1, lr2 = learning_rates.float().split(1, dim=-1)
-        grad_w0 = torch.einsum(
-            "blhd,blhk->bhdk",
-            input_heads * lr0.unsqueeze(2),
-            d_gate,
+        # Fold the three identically shaped update GEMMs into one batch, as
+        # in LACT. This changes only launch geometry, not the update math.
+        batch_heads = batch_size * num_heads
+        gradient_left = torch.stack(
+            (
+                input_heads * lr0.unsqueeze(2),
+                error_heads,
+                input_heads * lr2.unsqueeze(2),
+            )
+        ).permute(0, 1, 3, 4, 2).reshape(
+            3 * batch_heads,
+            head_dim,
+            seq_len,
         )
-        grad_w1 = torch.einsum(
-            "blhk,blhd->bhkd",
-            hidden * lr1.unsqueeze(2),
-            error_heads,
+        gradient_right = torch.stack(
+            (
+                d_gate,
+                hidden * lr1.unsqueeze(2),
+                d_up,
+            )
+        ).permute(0, 1, 3, 2, 4).reshape(
+            3 * batch_heads,
+            seq_len,
+            self.hidden_dim,
         )
-        grad_w2 = torch.einsum(
-            "blhd,blhk->bhdk",
-            input_heads * lr2.unsqueeze(2),
-            d_up,
-        )
+        grad_w0, grad_w1_transposed, grad_w2 = torch.bmm(
+            gradient_left,
+            gradient_right,
+        ).reshape(
+            3,
+            batch_size,
+            num_heads,
+            head_dim,
+            self.hidden_dim,
+        ).unbind(0)
+        grad_w1 = grad_w1_transposed.transpose(-1, -2)
         return grad_w0, grad_w1, grad_w2
 
     def muon_updates(self, gradients, steps):
@@ -324,6 +345,65 @@ class MARSBlock(nn.Module):
             return self._compiled_memory_mlp_chunk(x, *fast_weights)
         return self._apply_memory_mlp_chunk(x, *fast_weights)
 
+    def _apply_window_memory_mlp_chunk(
+        self,
+        x,
+        window_group_size,
+        *fast_weights,
+    ):
+        x = self._apply_window_attention(x, window_group_size)
+        return self._apply_memory_mlp_chunk(x, *fast_weights)
+
+    @torch.compile
+    def _compiled_window_memory_mlp_chunk(
+        self,
+        x,
+        window_group_size,
+        *fast_weights,
+    ):
+        return self._apply_window_memory_mlp_chunk(
+            x,
+            window_group_size,
+            *fast_weights,
+        )
+
+    @torch.compile
+    def _compiled_checkpoint_window_memory_mlp_chunk(
+        self,
+        x,
+        window_group_size,
+        *fast_weights,
+    ):
+        return checkpoint.checkpoint(
+            self._apply_window_memory_mlp_chunk,
+            x,
+            window_group_size,
+            *fast_weights,
+            preserve_rng_state=True,
+            use_reentrant=False,
+        )
+
+    def apply_window_memory_mlp_chunk(
+        self,
+        x,
+        window_group_size,
+        fast_weights,
+        use_checkpoint=False,
+    ):
+        args = (x, window_group_size, *fast_weights)
+        if use_checkpoint:
+            if x.is_cuda:
+                return self._compiled_checkpoint_window_memory_mlp_chunk(*args)
+            return checkpoint.checkpoint(
+                self._apply_window_memory_mlp_chunk,
+                *args,
+                preserve_rng_state=True,
+                use_reentrant=False,
+            )
+        if x.is_cuda:
+            return self._compiled_window_memory_mlp_chunk(*args)
+        return self._apply_window_memory_mlp_chunk(*args)
+
     def _feature_mask(self, batch_size, seq_len, update_index, device):
         """Mask an exact fraction of hidden channels for the whole chunk."""
         mask_count = int(round(self.dim * self.mask_ratio))
@@ -481,6 +561,7 @@ class VisionMARS(nn.Module):
         fw_base_lr=0.01,
         muon_update_steps=5,
         fw_update_group_size=1,
+        fw_update_layer_group_size=1,
         mars_mask_ratio=0.5,
         device=None,
         dtype=None,
@@ -503,6 +584,11 @@ class VisionMARS(nn.Module):
                 "fw_update_group_size must be positive, got "
                 f"{fw_update_group_size}"
             )
+        if fw_update_layer_group_size <= 0:
+            raise ValueError(
+                "fw_update_layer_group_size must be positive, got "
+                f"{fw_update_layer_group_size}"
+            )
         factory_kwargs = {"device": device, "dtype": dtype}
         self.use_checkpoint = use_checkpoint
         self.checkpoint_num = checkpoint_num
@@ -518,6 +604,7 @@ class VisionMARS(nn.Module):
         temporal_tokens = num_frames // kernel_size
         self.tokens_per_tubelet = self.patch_embed.num_patches + 1
         self.fw_update_group_size = int(fw_update_group_size)
+        self.fw_update_layer_group_size = int(fw_update_layer_group_size)
         self.chunk_size = self.tokens_per_tubelet * self.fw_update_group_size
         self.window_size = self.chunk_size
         self.cls_token = nn.Parameter(
@@ -568,6 +655,11 @@ class VisionMARS(nn.Module):
             ]
         )
         self.norm_f = norm_cls(embed_dim, **factory_kwargs)
+        self.register_buffer(
+            "_layer_indices",
+            torch.arange(depth, dtype=torch.int64),
+            persistent=False,
+        )
 
         self.apply(_base_init)
         trunc_normal_(self.pos_embed, std=0.02)
@@ -594,6 +686,268 @@ class VisionMARS(nn.Module):
     def get_num_layers(self):
         return len(self.layers)
 
+    def _batched_feature_mask(
+        self,
+        num_layers,
+        batch_size,
+        seq_len,
+        layer_indices,
+        update_index,
+        device,
+    ):
+        """Construct one exact channel mask per layer and sample."""
+        dim = self.embed_dim
+        mask_count = int(round(dim * self.layers[0].mask_ratio))
+        mask_count = min(max(mask_count, 1), dim - 1)
+        if self.training:
+            scores = torch.rand(num_layers, batch_size, dim, device=device)
+            masked_channels = scores.argsort(dim=-1)[..., :mask_count]
+        else:
+            channels = torch.arange(dim, device=device, dtype=torch.int64)
+            scores = (
+                channels.view(1, -1) * 1103515245
+                + (update_index + 1) * 12345
+                + (layer_indices.view(-1, 1) + 1) * 2654435761
+            ).remainder(2147483647)
+            masked_channels = scores.argsort(dim=-1)[:, :mask_count]
+            masked_channels = masked_channels.unsqueeze(1).expand(
+                -1,
+                batch_size,
+                -1,
+            )
+        channel_mask = torch.zeros(
+            num_layers,
+            batch_size,
+            dim,
+            dtype=torch.bool,
+            device=device,
+        )
+        channel_mask.scatter_(2, masked_channels, True)
+        return channel_mask.unsqueeze(2).expand(-1, -1, seq_len, -1)
+
+    def _batched_update_fast_weights(
+        self,
+        memory_inputs,
+        w0,
+        w1,
+        w2,
+        master_w0,
+        master_w1,
+        master_w2,
+        lr_weights,
+        layer_indices,
+        update_index,
+    ):
+        """Update several independent MARS layers in one GEMM batch."""
+        num_layers, batch_size, seq_len, dim = memory_inputs.shape
+        prediction_inputs = F.rms_norm(
+            memory_inputs,
+            normalized_shape=(dim,),
+            eps=1e-5,
+        )
+        with torch.autocast(
+            device_type=memory_inputs.device.type,
+            enabled=False,
+        ):
+            learning_rates = torch.bmm(
+                prediction_inputs.float().reshape(
+                    num_layers,
+                    batch_size * seq_len,
+                    dim,
+                ),
+                lr_weights.float().transpose(1, 2),
+            ).reshape(num_layers, batch_size, seq_len, 3)
+            learning_rates = F.softplus(
+                learning_rates + self.layers[0].base_lr_inverse
+            )
+        reconstruction_mask = self._batched_feature_mask(
+            num_layers,
+            batch_size,
+            seq_len,
+            layer_indices,
+            update_index,
+            memory_inputs.device,
+        )
+        masked_inputs = memory_inputs.masked_fill(reconstruction_mask, 0)
+        fast_weights, master_weights = self.layers[0].state.update(
+            masked_inputs.flatten(0, 1),
+            memory_inputs.detach().flatten(0, 1),
+            reconstruction_mask.flatten(0, 1),
+            learning_rates.flatten(0, 1),
+            tuple(weight.flatten(0, 1) for weight in (w0, w1, w2)),
+            tuple(
+                weight.flatten(0, 1)
+                for weight in (master_w0, master_w1, master_w2)
+            ),
+            self.layers[0].muon_update_steps,
+        )
+        fast_weights = tuple(
+            weight.reshape(num_layers, batch_size, *weight.shape[1:])
+            for weight in fast_weights
+        )
+        master_weights = tuple(
+            weight.reshape(num_layers, batch_size, *weight.shape[1:])
+            for weight in master_weights
+        )
+        return (*fast_weights, *master_weights)
+
+    @torch.compile
+    def _compiled_batched_update_fast_weights(self, *args):
+        return self._batched_update_fast_weights(*args)
+
+    @torch.compile
+    def _compiled_checkpoint_batched_update_fast_weights(self, *args):
+        return checkpoint.checkpoint(
+            self._batched_update_fast_weights,
+            *args,
+            preserve_rng_state=True,
+            use_reentrant=False,
+        )
+
+    def _update_layer_group(
+        self,
+        layers,
+        update_records,
+        fast_weights,
+        master_weights,
+        lr_weights,
+        layer_indices,
+        update_index,
+        use_checkpoint=False,
+    ):
+        memory_inputs = torch.stack(update_records)
+        args = (
+            memory_inputs,
+            *fast_weights,
+            *master_weights,
+            lr_weights,
+            layer_indices,
+            update_index,
+        )
+        full_group = len(layers) == self.fw_update_layer_group_size
+        if use_checkpoint:
+            if memory_inputs.is_cuda and full_group:
+                outputs = self._compiled_checkpoint_batched_update_fast_weights(
+                    *args
+                )
+            else:
+                outputs = checkpoint.checkpoint(
+                    self._batched_update_fast_weights,
+                    *args,
+                    preserve_rng_state=True,
+                    use_reentrant=False,
+                )
+        elif memory_inputs.is_cuda and full_group:
+            outputs = self._compiled_batched_update_fast_weights(*args)
+        else:
+            outputs = self._batched_update_fast_weights(*args)
+        return outputs[:3], outputs[3:]
+
+    @staticmethod
+    def _init_layer_group_fast_weights(layers, batch_size):
+        layer_states = [layer.init_fast_weights(batch_size) for layer in layers]
+        fast_weights = tuple(
+            torch.stack([state[0][index] for state in layer_states])
+            for index in range(3)
+        )
+        master_weights = tuple(
+            torch.stack([state[1][index] for state in layer_states])
+            for index in range(3)
+        )
+        return fast_weights, master_weights
+
+    def _iter_cross_layer_groups(self):
+        for layer_start in range(
+            0,
+            len(self.layers),
+            self.fw_update_layer_group_size,
+        ):
+            yield (
+                layer_start,
+                min(
+                    layer_start + self.fw_update_layer_group_size,
+                    len(self.layers),
+                ),
+            )
+
+    def _forward_cross_layer_scan(self, x):
+        """Run strict chunk-major apply with cross-layer batched updates."""
+        batch_size, tubelets, _, _ = x.shape
+        layer_groups = []
+        layer_states = []
+        for layer_start, layer_end in self._iter_cross_layer_groups():
+            layers = self.layers[layer_start:layer_end]
+            fast_weights, master_weights = (
+                self._init_layer_group_fast_weights(layers, batch_size)
+            )
+            layer_groups.append(
+                {
+                    "start": layer_start,
+                    "layers": layers,
+                    "fast_weights": fast_weights,
+                    "master_weights": master_weights,
+                    "lr_weights": torch.stack(
+                        [layer.lr_proj.weight for layer in layers]
+                    ),
+                    "layer_indices": self._layer_indices[layer_start:layer_end],
+                }
+            )
+            layer_states.extend(
+                (len(layer_groups) - 1, layer_index)
+                for layer_index in range(len(layers))
+            )
+
+        group_outputs = []
+        update_index = 0
+        for group_start in range(0, tubelets, self.fw_update_group_size):
+            group_end = min(
+                group_start + self.fw_update_group_size,
+                tubelets,
+            )
+            hidden_states = x[:, group_start:group_end]
+            update_records = []
+            for layer_index, layer in enumerate(self.layers):
+                state_group_index, state_layer_index = layer_states[layer_index]
+                state_group = layer_groups[state_group_index]
+                hidden_states, memory_input = (
+                    layer.apply_window_memory_mlp_chunk(
+                        hidden_states,
+                        window_group_size=self.fw_update_group_size,
+                        fast_weights=tuple(
+                            weight[state_layer_index]
+                            for weight in state_group["fast_weights"]
+                        ),
+                        use_checkpoint=(
+                            self.use_checkpoint
+                            and layer_index < self.checkpoint_num
+                        ),
+                    )
+                )
+                update_records.append(memory_input)
+
+            if group_end < tubelets:
+                for state_group in layer_groups:
+                    layer_start = state_group["start"]
+                    layer_end = layer_start + len(state_group["layers"])
+                    fast_weights, master_weights = self._update_layer_group(
+                        state_group["layers"],
+                        update_records[layer_start:layer_end],
+                        state_group["fast_weights"],
+                        state_group["master_weights"],
+                        state_group["lr_weights"],
+                        state_group["layer_indices"],
+                        update_index,
+                        use_checkpoint=(
+                            self.use_checkpoint
+                            and layer_start < self.checkpoint_num
+                        ),
+                    )
+                    state_group["fast_weights"] = fast_weights
+                    state_group["master_weights"] = master_weights
+                update_index += 1
+            group_outputs.append(hidden_states)
+        return torch.cat(group_outputs, dim=1)
+
     def forward_features(self, x):
         x = self.patch_embed(x)
         batch_size, channels, tubelets, height, width = x.shape
@@ -614,14 +968,17 @@ class VisionMARS(nn.Module):
         x = x + self.temporal_pos_embedding.unsqueeze(2)
         x = self.pos_drop(x)
 
-        for index, layer in enumerate(self.layers):
-            x = layer.forward_scan(
-                x,
-                self.fw_update_group_size,
-                use_checkpoint=(
-                    self.use_checkpoint and index < self.checkpoint_num
-                ),
-            )
+        if self.fw_update_layer_group_size == 1:
+            for index, layer in enumerate(self.layers):
+                x = layer.forward_scan(
+                    x,
+                    self.fw_update_group_size,
+                    use_checkpoint=(
+                        self.use_checkpoint and index < self.checkpoint_num
+                    ),
+                )
+        else:
+            x = self._forward_cross_layer_scan(x)
         x = self.norm_f(x.to(dtype=self.norm_f.weight.dtype))
         return x[:, -1, 0]
 

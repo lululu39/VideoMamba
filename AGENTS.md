@@ -143,14 +143,20 @@
 - 调度严格为 apply-then-update：一个 group 用旧 state 完成 memory residual 和 slow MLP，
   当前 masked reconstruction update 只能供后续 group 使用；最后一个无消费者的 update
   跳过。F64/G8 每层 8 group/7 次有效 update，Middle 共 32 个相互独立的 recurrent scan。
+  `fw_update_layer_group_size=1` 保留原 layer-major 完整 scan；大于 1 时严格采用与
+  VideoLACT 相同的 chunk-major 调度，每个 chunk 先依次通过所有层，再把若干层独立的
+  reconstruction update 沿 layer 维折入 GEMM batch。两种调度的 apply-then-update
+  依赖图和数学结果相同；training random mask 的抽样次序不同但分布不变。
   reconstruction loss 只生成 fast-state update，不返回给 engine，也不加入 supervised loss。
 - 每层 `memory_gate` 零初始化，使 image checkpoint 初始化时模型函数严格保持 grouped-
   window VideoViT baseline。初始 step gate 先收到 outer gradient；gate 打开后，作为
   encoder 的 `w0/w2` 和作为 decoder 的 `w1` 都通过后续 group 获得 supervised
   meta-gradient。
-- CUDA 在 window attention、memory/slow-MLP apply 和 update 粒度使用 `torch.compile`；
-  `use_checkpoint/checkpoint_num` 覆盖每层完整 recurrent scan 并保留 random mask、
-  attention dropout 和 drop-path RNG state，与 VideoLACT 的 recurrent checkpoint 原则一致。
+- CUDA 在 window attention、memory/slow-MLP apply 和 update 粒度使用 `torch.compile`。
+  G1 的 `use_checkpoint/checkpoint_num` 继续覆盖每层完整 recurrent scan；cross-layer
+  模式则与 LACT 严格参考路径一样，checkpoint 每个 chunk 的单层完整 block apply 及
+  其后的 batched update。两条路径都保留 random mask、attention dropout 和 drop-path
+  RNG state；MARS batched update 自身会采样 mask，因此其 checkpoint 也必须保留 RNG。
 - Middle 默认 `dim=432`、depth 32、9 window-attention heads；64 帧/G8/400 类时总参数
   114,238,480。32 层 state 的 `w0/w1/w2` 共 35,831,808 参数，与同配置 VideoLACT
   fast weights 完全相同；MARS 没有 private Q/K/V/O projection，因此总参数少于
@@ -431,6 +437,10 @@
   `train.pid`/`train.log`。首个 compiled step 为 43.68 秒；step 20--29 的 20-step
   rolling time 为 `2.40--2.57 s/step`，PyTorch peak `15,917 MiB`、`nvidia-smi`
   每卡约 `18.5--18.7 GiB`，grad norm 约 3.10--3.13，loss scale 65,536，无 OOM/NaN。
+  该版本仍是 layer-major G1 调度；2026-08-22 按用户要求在 epoch 0 主动关闭以排查
+  相对 LACT-G4 的速度差距，tmux/launcher/ranks 均已退出、8 张 GPU 已释放且没有生成
+  checkpoint，不得 resume 该 W&B run。随后脚本加入 `fw_update_layer_group_size=4`，
+  新进程必须从 ImageViT checkpoint 重新开始。
 
 ## Weights & Biases 规则
 
@@ -572,7 +582,18 @@
 - 当前 Middle/F64/G8 单 H100 BF16 合成训练步（32 层完整 scan checkpoint、gate 0.1、
   label smoothing、AdamW，2 warmup/3 measure）稳定中位数为 `1.6216 s/step`、
   `4.933 clips/s`，peak allocated/reserved 为 `14.68/15.59 GiB`；首个编译步约
-  `24.78 s`。该结果不含 DDP、视频解码和 dataloader。
+  `24.78 s`。这是 layer-major G1 基线，不含 DDP、视频解码和 dataloader。
+- MARS cross-layer G4 已把 `w0/w1/w2` 三个 update GEMM 先合成一次 BMM，再把 4 层
+  独立 update 沿 batch 维合并；解析 reconstruction direction、Muon/NS、master/fast
+  update 和 apply-then-update 顺序均未改变。CPU eval 的 G1/G2 输出和所有参数梯度
+  等价，G2 batched-update checkpoint 与 eager 在 training random mask 下输出、输入
+  梯度和全部参数梯度等价；当前单元测试 11 项全部通过。H100 BF16 Middle/F64/G8/G4
+  真实 compiled+checkpoint B8 前后向与 AdamW 连续通过，单卡稳定中位数
+  `1.5464 s/step`、peak allocated/reserved `26.73/31.05 GiB`，相对 G1 快约 4.6%，
+  显存提高到与 LACT-G4 同一预算。相同 8 卡 DDP 合成 harness 下，MARS G1/G4/LACT-G4
+  中位数分别为 `2.0248/1.5713/1.6588 s/step`；MARS-G4 比原 G1 快 22.4%，并比
+  LACT-G4 快约 5.3%。`find_unused_parameters=False` 对 MARS-G1 没有改善
+  （`2.0403 s/step`），因此它不是速度根因。
 
 ### VideoLACT/VideoViT 其他验证
 

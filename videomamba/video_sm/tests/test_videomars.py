@@ -262,6 +262,86 @@ class PerLayerMARSTest(unittest.TestCase):
                     eager_parameter.grad,
                 )
 
+    @staticmethod
+    def _make_cross_layer_model(use_checkpoint=False):
+        model = VisionMARS(
+            img_size=32,
+            patch_size=16,
+            depth=2,
+            embed_dim=12,
+            num_heads=3,
+            num_classes=4,
+            num_frames=2,
+            fw_update_group_size=1,
+            fw_update_layer_group_size=2,
+            muon_update_steps=1,
+            use_checkpoint=use_checkpoint,
+            checkpoint_num=2 if use_checkpoint else 0,
+        )
+        with torch.no_grad():
+            for layer in model.layers:
+                layer.memory_gate.fill_(0.1)
+        return model
+
+    def test_cross_layer_g2_matches_layer_major_output_and_gradients(self):
+        torch.manual_seed(7)
+        layer_major = self._make_cross_layer_model().eval()
+        layer_major.fw_update_layer_group_size = 1
+        cross_layer = copy.deepcopy(layer_major)
+        cross_layer.fw_update_layer_group_size = 2
+        layer_input = torch.randn(1, 3, 2, 32, 32)
+        cross_input = layer_input.detach().clone()
+
+        layer_output = layer_major(layer_input)
+        cross_output = cross_layer(cross_input)
+        torch.testing.assert_close(cross_output, layer_output)
+        layer_output.square().mean().backward()
+        cross_output.square().mean().backward()
+        for layer_parameter, cross_parameter in zip(
+            layer_major.parameters(),
+            cross_layer.parameters(),
+        ):
+            if layer_parameter.grad is None:
+                self.assertIsNone(cross_parameter.grad)
+            else:
+                torch.testing.assert_close(
+                    cross_parameter.grad,
+                    layer_parameter.grad,
+                    atol=2e-5,
+                    rtol=2e-4,
+                )
+
+    def test_cross_layer_checkpoint_preserves_mask_rng_and_gradients(self):
+        torch.manual_seed(8)
+        eager = self._make_cross_layer_model().train()
+        checked = copy.deepcopy(eager)
+        checked.use_checkpoint = True
+        checked.checkpoint_num = 2
+        eager_input = torch.randn(1, 3, 2, 32, 32, requires_grad=True)
+        checked_input = eager_input.detach().clone().requires_grad_(True)
+
+        torch.manual_seed(9)
+        eager_output = eager(eager_input)
+        torch.manual_seed(9)
+        checked_output = checked(checked_input)
+        torch.testing.assert_close(checked_output, eager_output)
+        eager_output.square().mean().backward()
+        checked_output.square().mean().backward()
+        torch.testing.assert_close(checked_input.grad, eager_input.grad)
+        for eager_parameter, checked_parameter in zip(
+            eager.parameters(),
+            checked.parameters(),
+        ):
+            if eager_parameter.grad is None:
+                self.assertIsNone(checked_parameter.grad)
+            else:
+                torch.testing.assert_close(
+                    checked_parameter.grad,
+                    eager_parameter.grad,
+                    atol=2e-5,
+                    rtol=2e-4,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

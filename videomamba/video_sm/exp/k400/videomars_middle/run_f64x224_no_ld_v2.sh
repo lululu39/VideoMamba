@@ -66,6 +66,7 @@ exec "${CONDA_PREFIX}/bin/torchrun" \
     --fw_num_heads 1 \
     --fw_base_lr 0.01 \
     --fw_update_group_size 8 \
+    --fw_update_layer_group_size 4 \
     --muon_update_steps 5 \
     --mars_mask_ratio 0.5 \
     --use_checkpoint \

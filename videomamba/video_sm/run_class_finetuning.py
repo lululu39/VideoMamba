@@ -499,6 +499,7 @@ def main(args, ds_init):
             fw_num_heads=args.fw_num_heads,
             fw_base_lr=args.fw_base_lr,
             fw_update_group_size=args.fw_update_group_size,
+            fw_update_layer_group_size=args.fw_update_layer_group_size,
             muon_update_steps=args.muon_update_steps,
             mars_mask_ratio=args.mars_mask_ratio,
             use_checkpoint=args.use_checkpoint,
