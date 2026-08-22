@@ -440,7 +440,13 @@
   该版本仍是 layer-major G1 调度；2026-08-22 按用户要求在 epoch 0 主动关闭以排查
   相对 LACT-G4 的速度差距，tmux/launcher/ranks 均已退出、8 张 GPU 已释放且没有生成
   checkpoint，不得 resume 该 W&B run。随后脚本加入 `fw_update_layer_group_size=4`，
-  新进程必须从 ImageViT checkpoint 重新开始。
+  并从 ImageViT checkpoint 全新重启（没有 resume 旧指标）；新公网 W&B run 为
+  `https://wandb.ai/LVSM-Experiment/videosft/runs/uk8zo0pq`，tmux session 仍使用 run
+  name，launcher PID 为 `1275236`。首步含编译和 data warmup 为 25.09 秒；step 20--50
+  的 20-step rolling time 中位数为 `1.6879 s/step`，PyTorch peak `28,094 MiB`、
+  `nvidia-smi` 约 `35.0--35.2 GiB`/卡，grad norm 约 3.1--3.2、loss scale 65,536，
+  没有 NaN/OOM。八卡进程均为该 launcher 后代；纯训练粗算每 epoch 约 3.52 小时、
+  10 epoch 约 35.2 小时，另需计 validation/checkpoint 时间。
 
 ## Weights & Biases 规则
 
