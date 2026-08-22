@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "This v1 script belongs to the removed shared pixel-MAE MARS and must not be resumed or reused. Create a new run name/script for the per-layer hidden-reconstruction MARS." >&2
-exit 2
-
-RUN_NAME="video-mars-middle-k400-f64x224-no-ld-v1"
+RUN_NAME="video-mars-middle-k400-f64x224-no-ld-v2"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_SM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_DIR="/mnt/localssd/experiments/videovit/${RUN_NAME}"
@@ -65,16 +62,12 @@ exec "${CONDA_PREFIX}/bin/torchrun" \
     --opt adamw \
     --opt_betas 0.9 0.999 \
     --weight_decay 0.05 \
+    --fw_inter_multi 2 \
+    --fw_num_heads 1 \
+    --fw_base_lr 0.01 \
     --fw_update_group_size 8 \
     --muon_update_steps 5 \
     --mars_mask_ratio 0.5 \
-    --mars_encoder_dim 288 \
-    --mars_encoder_depth 2 \
-    --mars_encoder_num_heads 1 \
-    --mars_decoder_dim 64 \
-    --mars_decoder_depth 1 \
-    --mars_decoder_num_heads 1 \
-    --mars_decoder_mlp_ratio 2.0 \
     --use_checkpoint \
     --checkpoint_num 32 \
     --test_num_segment 4 \
