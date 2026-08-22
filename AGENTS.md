@@ -124,11 +124,10 @@
   self-attention `wq/wk/wv/wo` 和 fast SwiGLU `w0/w1/w2`；RMSNorm 无 affine，
   不属于 fast state。apply 时完整 chunk 的 token 共同进入 encoder；inner objective
   则先 mask，再让 encoder 只看到 visible token，不能让 masked hidden 泄漏进 encoder。
-- encoder 的 `mars_encoder_dim/depth/num_heads` 均可配置。默认 dim 是主干 dim 的
-  `2/3`，depth 2，head 数是 window-attention head 数的 `2/3`：Middle 对应
-  dim 288、2 layers、6 heads；fast SwiGLU 默认 `fw_inter_multi=2`。这是层数较少、
-  bottleneck 较小且总参数仍与 private VideoLACT 同档的首轮设置，若实测过慢或 OOM
-  再降低 encoder dim/depth。
+- encoder 的 `mars_encoder_dim/depth/num_heads` 均可配置。正式轻量默认是 dim 64、
+  depth 1、1 head（构造函数未显式给 dim 时取 `min(64, embed_dim)`）；fast SwiGLU
+  默认 `fw_inter_multi=2`。旧首版默认曾为 Middle dim 288、2 layers、6 heads，实测
+  F64/B1 即使不用 checkpoint 也超过 80 GiB，因此不再作为默认配置。
 - 每个 chunk 先用旧 state 对全部 token apply；仅当存在后继 chunk 时，才对当前
   chunk 做 masked hidden-state reconstruction 并更新 state，因此严格保持
   apply-then-update，最后一个无后继 state 的 update 必须跳过。
@@ -139,7 +138,7 @@
   deterministic mask，不能消耗 evaluation RNG。
 - masked visible token 经过当前 fast Transformer encoder 后进入每层独立的 tiny
   Transformer decoder。decoder 的 dim/depth/head/MLP ratio 均可配置，默认是
-  64 dim、1 layer、1 head、ratio-2 MLP；固定 1D sin-cos position embedding 不
+  32 dim、1 layer、1 head、ratio-2 MLP；固定 1D sin-cos position embedding 不
   持久化。fast encoder 与 decoder 的 inner attention 都必须使用支持二阶梯度的
   显式 softmax，不能切换到当前不支持 double backward 的 fused SDPA；主干 window
   attention 仍可使用高效 SDPA。
@@ -156,14 +155,18 @@
   分支在 image checkpoint 初始化时不扰动 window-attention/slow-MLP 主干。初始 step
   只有 gate 先收到 outer gradient；gate 打开后，future chunk 对更新后 state 的消费
   才为 fast encoder 和 decoder 提供 meta-gradient。
-- activation checkpoint 必须覆盖一层的完整 recurrent scan并保留 RNG state，不能
-  切断需要被后继 chunk 消费的 state history。首版只实现 layer-major G1 调度；
-  `fw_update_group_size` 是 temporal tubelet grouping，不是 LACT 的 cross-layer
-  update batching。
+- 从 recurrent 依赖看，activation checkpoint 必须覆盖一层的完整 scan 并保留 RNG
+  state，不能在 chunk 间切断需要被后继 chunk 消费的 state history；但当前 inner
+  objective 在 forward 内调用 exact `autograd.grad`，non-reentrant checkpoint 会在
+  inner gradient 索取 saved tensor 时即时重算完整 scan，反而导致约 77 GiB OOM。
+  在为 nested autograd 重新设计 checkpoint 边界前，VideoMARS 的可运行配置应关闭
+  checkpoint。首版只实现 layer-major G1 调度；`fw_update_group_size` 是 temporal
+  tubelet grouping，不是 LACT 的 cross-layer update batching。
 - Middle 默认 `dim=432`、depth 32、9 window-attention heads；64 帧/G8/400 类时
-  总参数 142,266,384，其中 fast Transformer state 61,046,784（每 block
-  1,907,712）、32 个默认 1-layer tiny decoder 合计 2,854,400。总量比 private-proj
-  VideoLACT-Middle 的 138,348,136 多约 2.8%，属于同一参数量级。
+  轻量默认总参数 82,617,360，其中 fast Transformer state 3,080,192（每 block
+  96,256）、32 个 1-layer tiny decoder 合计 1,171,968。旧 288×2/6-head encoder、
+  64×1 decoder 配置总参数 142,266,384；轻量默认减少约 41.9%，并已不再与
+  private-proj VideoLACT-Middle 的 138,348,136 参数量匹配。
 
 ## LACT 参考实现与 chunk/update 结论
 
@@ -493,25 +496,29 @@
 - VideoMARS/VideoLACT F64 训练 step 对照使用
   `videomamba/video_sm/benchmark_mars_lact.py`：单张 H100、224²、64 帧、G8、BF16、
   drop-path 0.8、label smoothing、AdamW、memory gate 0.1；完成 warmup 的结果包含
-  optimizer state，MARS 则在首个 forward、Adam state 尚未建立前就已 OOM。
-  LACT 是 private/share-init strict G4，MARS 使用默认 encoder 288×2/6 heads 和
-  decoder 64×1/1 head。MARS 在整层 scan checkpoint、B1 的首个 forward inner
-  gradient 阶段 OOM：普通 allocator 为 `76.51/78.41 GiB` allocated/reserved，
+  optimizer state；旧 MARS 配置则在首个 forward、Adam state 尚未建立前就已 OOM。
+  LACT 是 private/share-init strict G4；以下 OOM 数据使用 MARS 的旧首版 encoder
+  288×2/6 heads 和 decoder 64×1/1 head。MARS 在整层 scan checkpoint、B1 的首个
+  forward inner gradient 阶段 OOM：普通 allocator 为 `76.51/78.41 GiB`
+  allocated/reserved，
   expandable segments 仍在 `77.64/78.41 GiB` OOM，因此不是 allocator 碎片假象；
-  完全关闭 checkpoint 也在 `76.38/78.41 GiB` OOM，默认 MARS 当前无法在 80 GiB
+  完全关闭 checkpoint 也在 `76.38/78.41 GiB` OOM，旧 MARS 配置无法在 80 GiB
   H100 上完成 B1 训练 step，不能报告有效 step time。
 - 同一 harness 下 VideoLACT B1 在 compile warmup 后中位 `0.7323 s/step`、
   `1.366 clips/s`、peak allocated/reserved `5.29/6.05 GiB`；脚本真实 B8 为
   `1.6276 s/step`、`4.915 clips/s`、`27.27/31.90 GiB`。MARS 在尚未完成 forward
   时的 allocated 已至少是 LACT B1 完整 step 的 14.7 倍，也是 LACT B8 的 2.85 倍。
-- MARS OOM 还包含 checkpoint 边界问题：即使临时缩到 encoder 64×1/1 head、decoder
-  32×1（82.62M 参数），整层 non-reentrant checkpoint 包住内部 exact
+- MARS OOM 还包含 checkpoint 边界问题：即使缩到现在的正式轻量默认 encoder
+  64×1/1 head、decoder 32×1（82.62M 参数），整层 non-reentrant checkpoint 包住内部 exact
   `autograd.grad` 时仍在 `77.43/78.42 GiB` OOM；同一缩小模型关闭 checkpoint 可运行，
-  B1 为 `9.7376 s/step`、`0.103 clips/s`、`30.49/31.00 GiB`。这证明当前整层
+  早期单步测得 B1 `9.7376 s/step`、`0.103 clips/s`、`30.49/31.00 GiB`。正式默认
+  复测（1 warmup/2 measure）为 B1 `9.7534 s/step`、`0.103 clips/s`、
+  `29.73/29.96 GiB`；B2（1 warmup/1 measure）为 `9.8402 s/step`、
+  `0.203 clips/s`、`58.31/58.74 GiB`。这证明当前整层
   checkpoint 会在 inner gradient 索取 saved tensor 时即时重算完整 scan并放大显存，
-  而默认 288×2 fast Transformer 本身在无 checkpoint 下也超出 80 GiB。后续必须先
-  重设适用于 nested autograd 的 checkpoint 边界，再讨论缩 dim/depth；不能把此次
-  OOM 单纯归因于参数量。
+  而旧 288×2 fast Transformer 本身在无 checkpoint 下也超出 80 GiB。轻量化解决了
+  B1/B2 可运行性，但每步仍包含 32 层乘 7 次 inner update 的显式 attention、exact
+  gradient 和二阶 outer backward；因此参数量大降并没有让 step time 同比例下降。
 - Image ViT 初始化：VideoViT、VideoLACT 和 VideoMARS 都已验证 2D patch kernel
   中心膨胀、window QKV/slow MLP 逐值加载及类别头跳过；LACT/MARS-only 参数保持
   新初始化，MARS gate 保持全零。VideoMARS registry 构造和 Middle 参数量也已验证。

@@ -457,12 +457,12 @@ class MARSBlock(nn.Module):
         mlp_ratio=3.0,
         residual_in_fp32=True,
         fw_inter_multi=2,
-        encoder_dim=288,
-        encoder_depth=2,
-        encoder_num_heads=6,
+        encoder_dim=64,
+        encoder_depth=1,
+        encoder_num_heads=1,
         muon_update_steps=5,
         mask_ratio=0.5,
-        decoder_dim=64,
+        decoder_dim=32,
         decoder_depth=1,
         decoder_num_heads=1,
         decoder_mlp_ratio=2.0,
@@ -753,9 +753,9 @@ class VisionMARS(nn.Module):
         fw_update_group_size=1,
         mars_mask_ratio=0.5,
         mars_encoder_dim=None,
-        mars_encoder_depth=2,
+        mars_encoder_depth=1,
         mars_encoder_num_heads=None,
-        mars_decoder_dim=64,
+        mars_decoder_dim=32,
         mars_decoder_depth=1,
         mars_decoder_num_heads=1,
         mars_decoder_mlp_ratio=2.0,
@@ -779,9 +779,9 @@ class VisionMARS(nn.Module):
                 f"{fw_update_group_size}"
             )
         if mars_encoder_dim is None:
-            mars_encoder_dim = 2 * embed_dim // 3
+            mars_encoder_dim = min(64, embed_dim)
         if mars_encoder_num_heads is None:
-            mars_encoder_num_heads = max(1, 2 * num_heads // 3)
+            mars_encoder_num_heads = 1
         factory_kwargs = {"device": device, "dtype": dtype}
         self.use_checkpoint = use_checkpoint
         self.checkpoint_num = checkpoint_num
