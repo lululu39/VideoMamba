@@ -484,7 +484,14 @@
   `video-mars-middle-k400-f64x224-no-ld-v4`。除 MARS state 语义外沿用 v3 的 ImageViT
   初始化和 F64/no-LD recipe，显式使用 G8 temporal group、cross-layer G16、CNN width
   64、50% mixed tube/random full-token mask、per-token LR 和 post-NS update scale 0.03。
-  v4 尚未启动正式 K400/W&B run。
+  实现 commit 为 `0eaeacd`。正式 K400 run 于 2026-08-23 从 ImageViT best checkpoint
+  全新启动，公网 W&B 为 `https://wandb.ai/LVSM-Experiment/videosft/runs/3kdnkzfh`；
+  run/guard tmux session 分别为 run name 和追加 `-guard`，launcher/guard PID 为
+  `1051205`/`1058042`，日志和 PID 位于
+  `/mnt/localssd/experiments/videovit/video-mars-middle-k400-f64x224-no-ld-v4/`。
+  首步含 data/compile warmup 为 57.63 秒；step 20--34 稳态约 `1.98--2.07 s/step`，
+  PyTorch peak 32,476 MiB、`nvidia-smi` 约 36.5 GiB/卡，grad norm 约 3.11--3.15、
+  loss scale 65,536，无 OOM/NaN。guard 每 5 秒只保留 launcher 后代并在训练退出后自停。
 
 ## Weights & Biases 规则
 
