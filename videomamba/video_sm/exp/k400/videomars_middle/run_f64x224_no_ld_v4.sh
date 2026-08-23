@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUN_NAME="video-mars-middle-k400-f64x224-no-ld-v3"
+RUN_NAME="video-mars-middle-k400-f64x224-no-ld-v4"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VIDEO_SM_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 RUN_DIR="/mnt/localssd/experiments/videovit/${RUN_NAME}"
@@ -66,7 +66,9 @@ exec "${CONDA_PREFIX}/bin/torchrun" \
     --fw_update_group_size 8 \
     --fw_update_layer_group_size 16 \
     --muon_update_steps 5 \
-    --mars_mask_ratio 0.75 \
+    --mars_mask_ratio 0.5 \
+    --mars_tube_mask_fraction 0.5 \
+    --mars_update_scale 0.03 \
     --mars_cnn_dim 64 \
     --use_checkpoint \
     --checkpoint_num 32 \

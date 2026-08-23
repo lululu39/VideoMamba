@@ -21,16 +21,16 @@ from .videolact import (
 )
 
 
-class MaskedAutoencoderConv3d(nn.Module):
-    """Per-sample fast CNN encoder/decoder for masked-token reconstruction.
+class MaskedResidualDenoiserConv3d(nn.Module):
+    """Per-sample residual CNN state trained by masked reconstruction.
 
-    Both halves are ``1x1 -> depthwise 3D convolution -> 1x1`` residual
-    bottlenecks.  The encoder is also the recurrent apply mapping.  During an
-    update, complete patch tokens are hidden from the encoder; encoded visible
-    tokens and a learned decoder mask token form the decoder input.
+    One ``down -> depthwise 3D convolution -> up`` state is used for both the
+    recurrent apply and the reconstruction update.  Masked patch tokens are
+    replaced before the same denoiser is evaluated, so the full-dimensional
+    identity skip cannot leak their targets.
     """
 
-    num_weights = 6
+    num_weights = 3
 
     def __init__(
         self,
@@ -76,34 +76,18 @@ class MaskedAutoencoderConv3d(nn.Module):
                 / math.sqrt(volume)
             )
 
-        self.encoder_in = matrix(self.dim, self.hidden_dim)
-        self.encoder_kernel = depthwise_kernel()
-        self.encoder_out = matrix(self.hidden_dim, self.dim)
-        self.decoder_in = matrix(self.dim, self.hidden_dim)
-        self.decoder_kernel = depthwise_kernel()
-        self.decoder_out = matrix(self.hidden_dim, self.dim)
-        self.encoder_mask_token = nn.Parameter(
-            torch.zeros(self.dim, **parameter_kwargs)
-        )
-        self.decoder_mask_token = nn.Parameter(
-            torch.zeros(self.dim, **parameter_kwargs)
-        )
-        nn.init.normal_(self.encoder_mask_token, std=0.02)
-        nn.init.normal_(self.decoder_mask_token, std=0.02)
+        self.down = matrix(self.dim, self.hidden_dim)
+        self.kernel = depthwise_kernel()
+        self.up = matrix(self.hidden_dim, self.dim)
+        self.mask_token = nn.Parameter(torch.zeros(self.dim, **parameter_kwargs))
+        nn.init.normal_(self.mask_token, std=0.02)
 
     def state_parameters(self):
-        return (
-            self.encoder_in,
-            self.encoder_kernel,
-            self.encoder_out,
-            self.decoder_in,
-            self.decoder_kernel,
-            self.decoder_out,
-        )
+        return self.down, self.kernel, self.up
 
     @staticmethod
     def _normalize_weight(weight, index):
-        if index in (1, 4):
+        if index == 1:
             flat = weight.flatten(2)
             return F.normalize(flat, dim=2, eps=1e-5).reshape_as(weight)
         return F.normalize(weight, dim=1, eps=1e-5)
@@ -166,21 +150,27 @@ class MaskedAutoencoderConv3d(nn.Module):
             width,
         ).permute(0, 2, 3, 4, 1)
 
-    def _cnn(self, x, input_weight, kernel, output_weight):
-        hidden = F.silu(self._pointwise(x, input_weight))
+    def _denoise_grid(self, x, down, kernel, up):
+        normalized_input = F.rms_norm(
+            x,
+            normalized_shape=(self.dim,),
+            eps=self.norm_epsilon,
+        )
+        hidden = F.silu(self._pointwise(normalized_input, down))
         normalized = F.rms_norm(
             hidden,
             normalized_shape=(self.hidden_dim,),
             eps=self.norm_epsilon,
         )
         hidden = hidden + F.silu(self._depthwise_conv3d(normalized, kernel))
-        return self._pointwise(hidden, output_weight)
+        return F.rms_norm(
+            x + self._pointwise(hidden, up),
+            normalized_shape=(self.dim,),
+            eps=self.norm_epsilon,
+        )
 
-    def encode_grid(self, x, fast_weights):
-        return self._cnn(x, fast_weights[0], fast_weights[1], fast_weights[2])
-
-    def decode_grid(self, x, fast_weights):
-        return self._cnn(x, fast_weights[3], fast_weights[4], fast_weights[5])
+    def denoise_grid(self, x, fast_weights):
+        return self._denoise_grid(x, *fast_weights)
 
     @staticmethod
     def _split_tokens(x, group_size, height, width):
@@ -219,26 +209,37 @@ class MaskedAutoencoderConv3d(nn.Module):
             token = token.unsqueeze(0).expand(batch_size, -1)
         return token.view(batch_size, *([1] * (ndim - 2)), token.shape[-1])
 
-    def apply_encoder(self, x, fast_weights, group_size, height, width):
+    def apply_denoiser(self, x, fast_weights, group_size, height, width):
         cls_tokens, patch_tokens = self._split_tokens(
             x,
             group_size,
             height,
             width,
         )
-        encoded_patches = self.encode_grid(patch_tokens, fast_weights)
+        denoised_patches = self.denoise_grid(patch_tokens, fast_weights)
         # CLS has no natural 3D-grid location.  It shares both pointwise
-        # encoder weights and receives the current frame's pooled patch latent.
-        cls_hidden = F.silu(self._pointwise(cls_tokens, fast_weights[0]))
-        patch_hidden = F.silu(self._pointwise(patch_tokens, fast_weights[0]))
-        cls_hidden = cls_hidden + patch_hidden.mean(dim=(2, 3))
-        encoded_cls = self._pointwise(cls_hidden, fast_weights[2])
-        output = self._merge_tokens(encoded_cls, encoded_patches)
-        return F.rms_norm(
-            output,
+        # weights and receives the current tubelet's pooled patch latent.
+        normalized_cls = F.rms_norm(
+            cls_tokens,
             normalized_shape=(self.dim,),
             eps=self.norm_epsilon,
-        ).to(x.dtype)
+        )
+        normalized_patches = F.rms_norm(
+            patch_tokens,
+            normalized_shape=(self.dim,),
+            eps=self.norm_epsilon,
+        )
+        cls_hidden = F.silu(self._pointwise(normalized_cls, fast_weights[0]))
+        patch_hidden = F.silu(
+            self._pointwise(normalized_patches, fast_weights[0])
+        )
+        cls_hidden = cls_hidden + patch_hidden.mean(dim=(2, 3))
+        denoised_cls = F.rms_norm(
+            cls_tokens + self._pointwise(cls_hidden, fast_weights[2]),
+            normalized_shape=(self.dim,),
+            eps=self.norm_epsilon,
+        )
+        return self._merge_tokens(denoised_cls, denoised_patches).to(x.dtype)
 
     def reconstruct(
         self,
@@ -248,8 +249,7 @@ class MaskedAutoencoderConv3d(nn.Module):
         group_size,
         height,
         width,
-        encoder_mask_token=None,
-        decoder_mask_token=None,
+        mask_token=None,
     ):
         _, patch_tokens = self._split_tokens(x, group_size, height, width)
         batch_size = patch_tokens.shape[0]
@@ -258,43 +258,30 @@ class MaskedAutoencoderConv3d(nn.Module):
                 f"Token mask shape {tuple(token_mask.shape)} does not match "
                 f"patch grid {tuple(patch_tokens.shape[:-1])}"
             )
-        if encoder_mask_token is None:
-            encoder_mask_token = self.encoder_mask_token
-        if decoder_mask_token is None:
-            decoder_mask_token = self.decoder_mask_token
-        encoder_mask_token = self._expand_mask_token(
-            encoder_mask_token,
+        if mask_token is None:
+            mask_token = self.mask_token
+        mask_token = self._expand_mask_token(
+            mask_token,
             batch_size,
             patch_tokens.ndim,
         )
-        decoder_mask_token = self._expand_mask_token(
-            decoder_mask_token,
-            batch_size,
-            patch_tokens.ndim,
-        )
-        masked_encoder_input = torch.where(
+        masked_input = torch.where(
             token_mask.unsqueeze(-1),
-            encoder_mask_token,
+            mask_token,
             patch_tokens,
         )
-        encoded = self.encode_grid(masked_encoder_input, fast_weights)
-        decoder_input = torch.where(
-            token_mask.unsqueeze(-1),
-            decoder_mask_token,
-            encoded,
-        )
-        return self.decode_grid(decoder_input, fast_weights), patch_tokens
+        return self.denoise_grid(masked_input, fast_weights), patch_tokens
 
     def reconstruction_directions(
         self,
         x,
         token_mask,
+        learning_rates,
         fast_weights,
         group_size,
         height,
         width,
-        encoder_mask_token=None,
-        decoder_mask_token=None,
+        mask_token=None,
         create_graph=True,
     ):
         """Return the exact negative gradients of masked-token MSE."""
@@ -312,8 +299,19 @@ class MaskedAutoencoderConv3d(nn.Module):
                 group_size,
                 height,
                 width,
-                encoder_mask_token,
-                decoder_mask_token,
+                mask_token,
+            )
+            if learning_rates.shape != (x.shape[0], x.shape[1], 1):
+                raise ValueError(
+                    "Expected per-token learning rates "
+                    f"{(x.shape[0], x.shape[1], 1)}, got "
+                    f"{tuple(learning_rates.shape)}"
+                )
+            _, patch_learning_rates = self._split_tokens(
+                learning_rates,
+                group_size,
+                height,
+                width,
             )
             sequence_length = group_size * height * width
             loss = (
@@ -321,6 +319,7 @@ class MaskedAutoencoderConv3d(nn.Module):
                 * (
                     (reconstruction.float() - target.detach().float()).square()
                     * token_mask.unsqueeze(-1)
+                    * patch_learning_rates.float()
                 ).sum()
                 / sequence_length
             )
@@ -337,34 +336,25 @@ class MaskedAutoencoderConv3d(nn.Module):
             raise ValueError(
                 f"Expected {self.num_weights} directions, got {len(directions)}"
             )
-        encoder_in, encoder_kernel, encoder_out = directions[:3]
-        decoder_in, decoder_kernel, decoder_out = directions[3:]
+        down, kernel, up = directions
         matrices = torch.stack(
             (
-                encoder_in,
-                encoder_out.transpose(-1, -2),
-                decoder_in,
-                decoder_out.transpose(-1, -2),
+                down,
+                up.transpose(-1, -2),
             )
         )
         matrix_updates = zeropower_via_newtonschulz5(
             matrices.flatten(0, 1).float(),
             steps,
         ).reshape_as(matrices)
-        convolution_matrices = torch.stack(
-            (encoder_kernel.flatten(2), decoder_kernel.flatten(2))
-        )
         convolution_updates = zeropower_via_newtonschulz5(
-            convolution_matrices.flatten(0, 1).float(),
+            kernel.flatten(2).float(),
             steps,
-        ).reshape_as(convolution_matrices)
+        ).reshape_as(kernel)
         return (
             matrix_updates[0],
-            convolution_updates[0].reshape_as(encoder_kernel),
+            convolution_updates,
             matrix_updates[1].transpose(-1, -2),
-            matrix_updates[2],
-            convolution_updates[1].reshape_as(decoder_kernel),
-            matrix_updates[3].transpose(-1, -2),
         )
 
     def update(
@@ -378,34 +368,33 @@ class MaskedAutoencoderConv3d(nn.Module):
         group_size,
         height,
         width,
-        encoder_mask_token=None,
-        decoder_mask_token=None,
+        update_scale=0.03,
+        mask_token=None,
     ):
-        if learning_rates.shape != (x.shape[0], self.num_weights):
+        if learning_rates.shape != (x.shape[0], x.shape[1], 1):
             raise ValueError(
-                f"Expected learning rates {(x.shape[0], self.num_weights)}, "
+                "Expected per-token learning rates "
+                f"{(x.shape[0], x.shape[1], 1)}, "
                 f"got {tuple(learning_rates.shape)}"
+            )
+        if update_scale <= 0:
+            raise ValueError(
+                f"update_scale must be positive, got {update_scale}"
             )
         directions = self.reconstruction_directions(
             x,
             token_mask,
+            learning_rates,
             fast_weights,
             group_size,
             height,
             width,
-            encoder_mask_token,
-            decoder_mask_token,
+            mask_token,
             create_graph=self.training and torch.is_grad_enabled(),
         )
-        scaled_directions = tuple(
-            direction * learning_rates[:, index].view(
-                x.shape[0], *([1] * (direction.ndim - 1))
-            )
-            for index, direction in enumerate(directions)
-        )
-        updates = self.muon_updates(scaled_directions, muon_update_steps)
+        updates = self.muon_updates(directions, muon_update_steps)
         master_weights = tuple(
-            master + update.to(master.dtype)
+            master + float(update_scale) * update.to(master.dtype)
             for master, update in zip(master_weights, updates)
         )
         fast_weights = tuple(
@@ -435,6 +424,8 @@ class MARSBlock(nn.Module):
         fw_base_lr=0.01,
         muon_update_steps=5,
         mask_ratio=0.5,
+        tube_mask_fraction=0.5,
+        update_scale=0.03,
         norm_epsilon=1e-5,
         device=None,
         dtype=None,
@@ -442,6 +433,15 @@ class MARSBlock(nn.Module):
         super().__init__()
         if not 0.0 < mask_ratio < 1.0:
             raise ValueError(f"mask_ratio must be in (0, 1), got {mask_ratio}")
+        if not 0.0 <= tube_mask_fraction <= 1.0:
+            raise ValueError(
+                "tube_mask_fraction must be in [0, 1], got "
+                f"{tube_mask_fraction}"
+            )
+        if update_scale <= 0:
+            raise ValueError(
+                f"update_scale must be positive, got {update_scale}"
+            )
         if fw_base_lr <= 0:
             raise ValueError(f"fw_base_lr must be positive, got {fw_base_lr}")
         if muon_update_steps < 0:
@@ -452,6 +452,8 @@ class MARSBlock(nn.Module):
         self.dim = dim
         self.layer_index = int(layer_index)
         self.mask_ratio = float(mask_ratio)
+        self.tube_mask_fraction = float(tube_mask_fraction)
+        self.update_scale = float(update_scale)
         self.spatial_size = tuple(int(size) for size in spatial_size)
         if len(self.spatial_size) != 2 or any(
             size <= 0 for size in self.spatial_size
@@ -477,7 +479,7 @@ class MARSBlock(nn.Module):
             TensorDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
         self.memory_norm = norm_cls(dim, **factory_kwargs)
-        self.state = MaskedAutoencoderConv3d(
+        self.state = MaskedResidualDenoiserConv3d(
             dim,
             hidden_dim=mars_cnn_dim,
             norm_epsilon=norm_epsilon,
@@ -486,7 +488,7 @@ class MARSBlock(nn.Module):
         self.memory_gate = nn.Parameter(torch.zeros(dim, **factory_kwargs))
         self.lr_proj = nn.Linear(
             dim,
-            MaskedAutoencoderConv3d.num_weights,
+            1,
             bias=False,
             **factory_kwargs,
         )
@@ -543,7 +545,7 @@ class MARSBlock(nn.Module):
         memory_input = self.memory_norm(
             flat_x.to(dtype=self.memory_norm.weight.dtype)
         )
-        memory_output = self.state.apply_encoder(
+        memory_output = self.state.apply_denoiser(
             memory_input,
             fast_weights,
             group_size,
@@ -629,14 +631,17 @@ class MARSBlock(nn.Module):
         return self._apply_window_memory_mlp_chunk(*args)
 
     def _token_mask(self, batch_size, group_size, update_index, device):
-        """Tube-mask an exact fraction of complete spatial patch tokens."""
+        """Mask an exact mix of full tubes and independent patch tokens."""
         height, width = self.spatial_size
         patch_count = height * width
-        mask_count = int(round(patch_count * self.mask_ratio))
-        mask_count = min(max(mask_count, 1), patch_count - 1)
+        total_count = group_size * patch_count
+        mask_count = int(round(total_count * self.mask_ratio))
+        mask_count = min(max(mask_count, 1), total_count - 1)
+        tube_count = int(mask_count * self.tube_mask_fraction) // group_size
+        tube_count = min(tube_count, patch_count - 1)
         if self.training:
             scores = torch.rand(batch_size, patch_count, device=device)
-            masked_tokens = scores.argsort(dim=-1)[:, :mask_count]
+            tube_tokens = scores.argsort(dim=-1)[:, :tube_count]
         else:
             tokens = torch.arange(patch_count, device=device, dtype=torch.int64)
             scores = (
@@ -644,24 +649,52 @@ class MARSBlock(nn.Module):
                 + (update_index + 1) * 12345
                 + (self.layer_index + 1) * 2654435761
             ).remainder(2147483647)
-            masked_tokens = scores.argsort()[:mask_count]
-            masked_tokens = masked_tokens.unsqueeze(0).expand(
+            tube_tokens = scores.argsort()[:tube_count]
+            tube_tokens = tube_tokens.unsqueeze(0).expand(
                 batch_size,
                 -1,
             )
         token_mask = torch.zeros(
             batch_size,
+            group_size,
             patch_count,
             dtype=torch.bool,
             device=device,
         )
-        token_mask.scatter_(1, masked_tokens, True)
-        return token_mask.reshape(batch_size, 1, height, width).expand(
-            -1,
-            group_size,
-            -1,
-            -1,
+        tube_mask = torch.zeros(
+            batch_size,
+            patch_count,
+            dtype=torch.bool,
+            device=device,
         )
+        tube_mask.scatter_(1, tube_tokens, True)
+        token_mask |= tube_mask.unsqueeze(1)
+        remaining_count = mask_count - tube_count * group_size
+        if self.training:
+            remaining_scores = torch.rand(
+                batch_size,
+                group_size,
+                patch_count,
+                device=device,
+            )
+        else:
+            positions = torch.arange(
+                total_count,
+                device=device,
+                dtype=torch.int64,
+            ).reshape(1, group_size, patch_count)
+            remaining_scores = (
+                positions * 1664525
+                + (update_index + 1) * 1013904223
+                + (self.layer_index + 1) * 2246822519
+            ).remainder(2147483647).float()
+            remaining_scores = remaining_scores.expand(batch_size, -1, -1)
+        remaining_scores = remaining_scores.masked_fill(token_mask, float("inf"))
+        remaining_tokens = remaining_scores.flatten(1).argsort(dim=-1)[
+            :, :remaining_count
+        ]
+        token_mask.flatten(1).scatter_(1, remaining_tokens, True)
+        return token_mask.reshape(batch_size, group_size, height, width)
 
     def _update_fast_weights(
         self,
@@ -669,8 +702,8 @@ class MARSBlock(nn.Module):
         update_index,
         *weights,
     ):
-        fast_weights = weights[: MaskedAutoencoderConv3d.num_weights]
-        master_weights = weights[MaskedAutoencoderConv3d.num_weights :]
+        fast_weights = weights[: MaskedResidualDenoiserConv3d.num_weights]
+        master_weights = weights[MaskedResidualDenoiserConv3d.num_weights :]
         prediction_input = F.rms_norm(
             memory_input,
             normalized_shape=(self.dim,),
@@ -686,7 +719,7 @@ class MARSBlock(nn.Module):
                     self.lr_proj.weight.float(),
                 )
                 + self.base_lr_inverse
-            ).mean(dim=1)
+            )
         height, width = self.spatial_size
         tokens_per_tubelet = height * width + 1
         if memory_input.shape[1] % tokens_per_tubelet:
@@ -711,6 +744,7 @@ class MARSBlock(nn.Module):
             group_size,
             height,
             width,
+            self.update_scale,
         )
         return (*fast_weights, *master_weights)
 
@@ -730,7 +764,7 @@ class MARSBlock(nn.Module):
             outputs = self._compiled_update_fast_weights(*args)
         else:
             outputs = self._update_fast_weights(*args)
-        split = MaskedAutoencoderConv3d.num_weights
+        split = MaskedResidualDenoiserConv3d.num_weights
         return outputs[:split], outputs[split:]
 
     def _forward_scan(self, x, fw_update_group_size):
@@ -801,7 +835,9 @@ class VisionMARS(nn.Module):
         muon_update_steps=5,
         fw_update_group_size=1,
         fw_update_layer_group_size=1,
-        mars_mask_ratio=0.75,
+        mars_mask_ratio=0.5,
+        mars_tube_mask_fraction=0.5,
+        mars_update_scale=0.03,
         device=None,
         dtype=None,
         use_checkpoint=False,
@@ -894,6 +930,8 @@ class VisionMARS(nn.Module):
                     fw_base_lr=fw_base_lr,
                     muon_update_steps=muon_update_steps,
                     mask_ratio=mars_mask_ratio,
+                    tube_mask_fraction=mars_tube_mask_fraction,
+                    update_scale=mars_update_scale,
                     norm_epsilon=norm_epsilon,
                     **factory_kwargs,
                 )
@@ -941,11 +979,16 @@ class VisionMARS(nn.Module):
         update_index,
         device,
     ):
-        """Construct one exact tube mask per layer and sample."""
+        """Construct one exact mixed tube/random mask per layer and sample."""
         height, width = self.spatial_size
         patch_count = height * width
-        mask_count = int(round(patch_count * self.layers[0].mask_ratio))
-        mask_count = min(max(mask_count, 1), patch_count - 1)
+        total_count = group_size * patch_count
+        mask_count = int(round(total_count * self.layers[0].mask_ratio))
+        mask_count = min(max(mask_count, 1), total_count - 1)
+        tube_count = int(
+            mask_count * self.layers[0].tube_mask_fraction
+        ) // group_size
+        tube_count = min(tube_count, patch_count - 1)
         if self.training:
             scores = torch.rand(
                 num_layers,
@@ -953,7 +996,7 @@ class VisionMARS(nn.Module):
                 patch_count,
                 device=device,
             )
-            masked_tokens = scores.argsort(dim=-1)[..., :mask_count]
+            tube_tokens = scores.argsort(dim=-1)[..., :tube_count]
         else:
             tokens = torch.arange(
                 patch_count,
@@ -965,8 +1008,8 @@ class VisionMARS(nn.Module):
                 + (update_index + 1) * 12345
                 + (layer_indices.view(-1, 1) + 1) * 2654435761
             ).remainder(2147483647)
-            masked_tokens = scores.argsort(dim=-1)[:, :mask_count]
-            masked_tokens = masked_tokens.unsqueeze(1).expand(
+            tube_tokens = scores.argsort(dim=-1)[:, :tube_count]
+            tube_tokens = tube_tokens.unsqueeze(1).expand(
                 -1,
                 batch_size,
                 -1,
@@ -974,18 +1017,58 @@ class VisionMARS(nn.Module):
         token_mask = torch.zeros(
             num_layers,
             batch_size,
+            group_size,
             patch_count,
             dtype=torch.bool,
             device=device,
         )
-        token_mask.scatter_(2, masked_tokens, True)
+        tube_mask = torch.zeros(
+            num_layers,
+            batch_size,
+            patch_count,
+            dtype=torch.bool,
+            device=device,
+        )
+        tube_mask.scatter_(2, tube_tokens, True)
+        token_mask |= tube_mask.unsqueeze(2)
+        remaining_count = mask_count - tube_count * group_size
+        if self.training:
+            remaining_scores = torch.rand(
+                num_layers,
+                batch_size,
+                group_size,
+                patch_count,
+                device=device,
+            )
+        else:
+            positions = torch.arange(
+                total_count,
+                device=device,
+                dtype=torch.int64,
+            ).reshape(1, 1, group_size, patch_count)
+            remaining_scores = (
+                positions * 1664525
+                + (update_index + 1) * 1013904223
+                + (layer_indices.view(-1, 1, 1, 1) + 1) * 2246822519
+            ).remainder(2147483647).float()
+            remaining_scores = remaining_scores.expand(
+                -1,
+                batch_size,
+                -1,
+                -1,
+            )
+        remaining_scores = remaining_scores.masked_fill(token_mask, float("inf"))
+        remaining_tokens = remaining_scores.flatten(2).argsort(dim=-1)[
+            ..., :remaining_count
+        ]
+        token_mask.flatten(2).scatter_(2, remaining_tokens, True)
         return token_mask.reshape(
             num_layers,
             batch_size,
-            1,
+            group_size,
             height,
             width,
-        ).expand(-1, -1, group_size, -1, -1)
+        )
 
     def _batched_update_fast_weights(
         self,
@@ -993,13 +1076,12 @@ class VisionMARS(nn.Module):
         *args,
     ):
         """Update several independent convolutional MARS layers together."""
-        num_weights = MaskedAutoencoderConv3d.num_weights
+        num_weights = MaskedResidualDenoiserConv3d.num_weights
         fast_weights = args[:num_weights]
         master_weights = args[num_weights : 2 * num_weights]
         (
             lr_weights,
-            encoder_mask_tokens,
-            decoder_mask_tokens,
+            mask_tokens,
             layer_indices,
             update_index,
         ) = args[2 * num_weights :]
@@ -1032,11 +1114,11 @@ class VisionMARS(nn.Module):
                 num_layers,
                 batch_size,
                 seq_len,
-                num_weights,
+                1,
             )
             learning_rates = F.softplus(
                 learning_rates + self.layers[0].base_lr_inverse
-            ).mean(dim=2)
+            )
         token_mask = self._batched_token_mask(
             num_layers,
             batch_size,
@@ -1046,12 +1128,7 @@ class VisionMARS(nn.Module):
             memory_inputs.device,
         )
         flat_batch_size = num_layers * batch_size
-        expanded_encoder_tokens = encoder_mask_tokens.unsqueeze(1).expand(
-            -1,
-            batch_size,
-            -1,
-        ).reshape(flat_batch_size, dim)
-        expanded_decoder_tokens = decoder_mask_tokens.unsqueeze(1).expand(
+        expanded_mask_tokens = mask_tokens.unsqueeze(1).expand(
             -1,
             batch_size,
             -1,
@@ -1066,8 +1143,8 @@ class VisionMARS(nn.Module):
             group_size,
             height,
             width,
-            expanded_encoder_tokens,
-            expanded_decoder_tokens,
+            self.layers[0].update_scale,
+            expanded_mask_tokens,
         )
         updated_fast = tuple(
             weight.reshape(num_layers, batch_size, *weight.shape[1:])
@@ -1109,8 +1186,7 @@ class VisionMARS(nn.Module):
             *fast_weights,
             *master_weights,
             lr_weights,
-            torch.stack([layer.state.encoder_mask_token for layer in layers]),
-            torch.stack([layer.state.decoder_mask_token for layer in layers]),
+            torch.stack([layer.state.mask_token for layer in layers]),
             layer_indices,
             update_index,
         )
@@ -1131,7 +1207,7 @@ class VisionMARS(nn.Module):
             outputs = self._compiled_batched_update_fast_weights(*args)
         else:
             outputs = self._batched_update_fast_weights(*args)
-        split = MaskedAutoencoderConv3d.num_weights
+        split = MaskedResidualDenoiserConv3d.num_weights
         return outputs[:split], outputs[split:]
 
     @staticmethod
@@ -1139,11 +1215,11 @@ class VisionMARS(nn.Module):
         layer_states = [layer.init_fast_weights(batch_size) for layer in layers]
         fast_weights = tuple(
             torch.stack([state[0][index] for state in layer_states])
-            for index in range(MaskedAutoencoderConv3d.num_weights)
+            for index in range(MaskedResidualDenoiserConv3d.num_weights)
         )
         master_weights = tuple(
             torch.stack([state[1][index] for state in layer_states])
-            for index in range(MaskedAutoencoderConv3d.num_weights)
+            for index in range(MaskedResidualDenoiserConv3d.num_weights)
         )
         return fast_weights, master_weights
 

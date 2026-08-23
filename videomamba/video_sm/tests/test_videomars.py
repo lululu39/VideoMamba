@@ -8,15 +8,15 @@ import torch.nn.functional as F
 
 from videomamba.video_sm.models.videomars import (
     MARSBlock,
-    MaskedAutoencoderConv3d,
+    MaskedResidualDenoiserConv3d,
     VisionMARS,
 )
 
 
-class MaskedAutoencoderConv3dTest(unittest.TestCase):
+class MaskedResidualDenoiserConv3dTest(unittest.TestCase):
     @staticmethod
     def _make_state():
-        return MaskedAutoencoderConv3d(dim=8, hidden_dim=4)
+        return MaskedResidualDenoiserConv3d(dim=8, hidden_dim=4)
 
     @staticmethod
     def _input():
@@ -30,7 +30,11 @@ class MaskedAutoencoderConv3dTest(unittest.TestCase):
         mask[..., 1, 1] = True
         return mask
 
-    def test_exact_reconstruction_directions_match_autograd(self):
+    @staticmethod
+    def _learning_rates():
+        return torch.linspace(0.005, 0.02, 20).reshape(2, 10, 1)
+
+    def test_weighted_reconstruction_directions_match_autograd(self):
         torch.manual_seed(0)
         state = self._make_state()
         fast_weights, _ = state.init_fast_weights(batch_size=2)
@@ -39,10 +43,17 @@ class MaskedAutoencoderConv3dTest(unittest.TestCase):
         )
         update_input = self._input()
         mask = self._mask()
+        learning_rates = self._learning_rates()
         reconstruction, target = state.reconstruct(
             update_input,
             mask,
             fast_weights,
+            group_size=2,
+            height=2,
+            width=2,
+        )
+        _, patch_learning_rates = state._split_tokens(
+            learning_rates,
             group_size=2,
             height=2,
             width=2,
@@ -52,6 +63,7 @@ class MaskedAutoencoderConv3dTest(unittest.TestCase):
             * (
                 (reconstruction.float() - target.detach().float()).square()
                 * mask.unsqueeze(-1)
+                * patch_learning_rates
             ).sum()
             / 8
         )
@@ -59,6 +71,7 @@ class MaskedAutoencoderConv3dTest(unittest.TestCase):
         directions = state.reconstruction_directions(
             update_input,
             mask,
+            learning_rates,
             fast_weights,
             group_size=2,
             height=2,
@@ -68,22 +81,50 @@ class MaskedAutoencoderConv3dTest(unittest.TestCase):
         for direction, gradient in zip(directions, expected):
             torch.testing.assert_close(direction, -gradient)
 
-    def test_encoder_and_decoder_both_mix_neighbor_tokens(self):
+    def test_apply_and_reconstruction_use_same_denoiser(self):
         torch.manual_seed(1)
         state = self._make_state()
         fast_weights, _ = state.init_fast_weights(batch_size=1)
         update_input = torch.randn(1, 10, 8)
-        mask = self._mask()[:1]
-        first, _ = state.reconstruct(
+        no_mask = torch.zeros(1, 2, 2, 2, dtype=torch.bool)
+        reconstruction, _ = state.reconstruct(
             update_input,
-            mask,
+            no_mask,
             fast_weights,
             2,
             2,
             2,
         )
+        _, patches = state._split_tokens(update_input, 2, 2, 2)
+        torch.testing.assert_close(
+            reconstruction,
+            state.denoise_grid(patches, fast_weights),
+        )
+        applied = state.apply_denoiser(update_input, fast_weights, 2, 2, 2)
+        _, applied_patches = state._split_tokens(applied, 2, 2, 2)
+        torch.testing.assert_close(applied_patches, reconstruction)
+
+    def test_denoiser_identity_skip_survives_zero_adapter(self):
+        torch.manual_seed(2)
+        state = self._make_state()
+        fast_weights, _ = state.init_fast_weights(batch_size=1)
+        x = torch.randn(1, 2, 2, 2, 8)
+        zero_up = torch.zeros_like(fast_weights[2])
+        actual = state.denoise_grid(
+            x,
+            (fast_weights[0], fast_weights[1], zero_up),
+        )
+        expected = F.rms_norm(x, normalized_shape=(8,), eps=1e-5)
+        torch.testing.assert_close(actual, expected)
+
+    def test_denoiser_mixes_neighbor_tokens(self):
+        torch.manual_seed(3)
+        state = self._make_state()
+        fast_weights, _ = state.init_fast_weights(batch_size=1)
+        update_input = torch.randn(1, 10, 8)
+        mask = self._mask()[:1]
+        first, _ = state.reconstruct(update_input, mask, fast_weights, 2, 2, 2)
         changed_input = update_input.clone()
-        # Change a visible patch neighboring a masked patch.
         changed_input[:, 2] += 1.0
         second, _ = state.reconstruct(
             changed_input,
@@ -93,11 +134,10 @@ class MaskedAutoencoderConv3dTest(unittest.TestCase):
             2,
             2,
         )
-        masked_difference = (second - first)[mask].abs().sum()
-        self.assertGreater(masked_difference.item(), 0.0)
+        self.assertGreater((second - first)[mask].abs().sum().item(), 0.0)
 
     def test_unfold_bmm_depthwise_conv_matches_conv3d(self):
-        torch.manual_seed(10)
+        torch.manual_seed(4)
         state = self._make_state()
         x = torch.randn(2, 3, 4, 4, 4, requires_grad=True)
         kernel = torch.randn(2, 4, 3, 3, 3, requires_grad=True)
@@ -130,68 +170,79 @@ class MaskedAutoencoderConv3dTest(unittest.TestCase):
         ):
             torch.testing.assert_close(actual_gradient, expected_gradient)
 
-    def test_update_normalizes_every_fast_weight(self):
-        torch.manual_seed(2)
-        state = self._make_state()
+    def test_update_scale_controls_master_step_and_normalizes_fast_weights(self):
+        torch.manual_seed(5)
+        state = self._make_state().eval()
         fast_weights, master_weights = state.init_fast_weights(batch_size=2)
-        updated_fast, updated_master = state.update(
-            self._input(),
-            self._mask(),
-            torch.full((2, state.num_weights), 0.01),
-            fast_weights,
-            master_weights,
-            muon_update_steps=1,
-            group_size=2,
-            height=2,
-            width=2,
-        )
-        for index, (fast_weight, master_weight) in enumerate(
-            zip(updated_fast, updated_master)
-        ):
-            expected = state._normalize_weight(master_weight, index).to(
-                fast_weight.dtype
-            )
-            torch.testing.assert_close(fast_weight, expected)
+        update_input = self._input()
+        token_mask = self._mask()
+        learning_rates = self._learning_rates()
 
-    def test_one_muon_update_reduces_reconstruction_loss(self):
-        torch.manual_seed(2)
-        state = MaskedAutoencoderConv3d(dim=48, hidden_dim=16).train()
-        fast_weights, master_weights = state.init_fast_weights(batch_size=2)
-        update_input = torch.randn(2, 10, 48)
-        mask = self._mask()
-
-        def reconstruction_loss(weights):
-            reconstruction, target = state.reconstruct(
+        def update(scale):
+            return state.update(
                 update_input,
-                mask,
-                weights,
+                token_mask,
+                learning_rates,
+                fast_weights,
+                master_weights,
+                muon_update_steps=1,
                 group_size=2,
                 height=2,
                 width=2,
+                update_scale=scale,
+            )
+
+        small_fast, small_master = update(0.01)
+        large_fast, large_master = update(0.03)
+        for index, (initial, small, large) in enumerate(
+            zip(master_weights, small_master, large_master)
+        ):
+            torch.testing.assert_close(large - initial, 3 * (small - initial))
+            expected = state._normalize_weight(large, index).to(
+                large_fast[index].dtype
+            )
+            torch.testing.assert_close(large_fast[index], expected)
+
+    def test_one_update_reduces_masked_reconstruction_loss(self):
+        torch.manual_seed(2)
+        state = MaskedResidualDenoiserConv3d(dim=48, hidden_dim=16).eval()
+        fast_weights, master_weights = state.init_fast_weights(batch_size=2)
+        update_input = torch.randn(2, 10, 48)
+        token_mask = self._mask()
+        learning_rates = torch.full((2, 10, 1), 0.01)
+
+        def loss(weights):
+            prediction, target = state.reconstruct(
+                update_input,
+                token_mask,
+                weights,
+                2,
+                2,
+                2,
             )
             return (
                 0.5
                 * (
-                    (reconstruction.float() - target.float()).square()
-                    * mask.unsqueeze(-1)
+                    (prediction.float() - target.float()).square()
+                    * token_mask.unsqueeze(-1)
                 ).sum()
                 / 8
             )
 
-        before = reconstruction_loss(fast_weights)
+        before = loss(fast_weights)
         updated_fast, _ = state.update(
             update_input,
-            mask,
-            torch.full((2, state.num_weights), 0.01),
+            token_mask,
+            learning_rates,
             fast_weights,
             master_weights,
             muon_update_steps=5,
             group_size=2,
             height=2,
             width=2,
+            update_scale=0.03,
         )
-        after = reconstruction_loss(updated_fast)
-        self.assertLess(after.item(), before.item())
+        self.assertLess(loss(updated_fast).item(), before.item())
 
 
 class PerLayerMARSTest(unittest.TestCase):
@@ -207,18 +258,24 @@ class PerLayerMARSTest(unittest.TestCase):
             fw_base_lr=0.01,
             muon_update_steps=1,
             mask_ratio=0.5,
+            tube_mask_fraction=0.5,
+            update_scale=0.03,
         )
 
-    def test_token_mask_is_tube_shaped_exact_and_eval_deterministic(self):
+    def test_mixed_mask_is_exact_and_eval_deterministic(self):
         block = self._make_block().eval()
         first = block._token_mask(2, 3, update_index=3, device="cpu")
         second = block._token_mask(2, 3, update_index=3, device="cpu")
         torch.testing.assert_close(first, second)
-        self.assertEqual(first[:, 0].flatten(1).sum(dim=-1).tolist(), [2, 2])
-        torch.testing.assert_close(first[:, :1].expand_as(first), first)
+        self.assertEqual(first.flatten(1).sum(dim=-1).tolist(), [6, 6])
+        # One spatial location is a full tube, while the random half differs
+        # over time.
+        full_tubes = first.all(dim=1).flatten(1).sum(dim=-1)
+        self.assertTrue(torch.all(full_tubes >= 1))
+        self.assertTrue(torch.any(first[:, 1:] != first[:, :1]))
 
-    def test_two_groups_give_all_fast_cnn_weights_exact_meta_gradients(self):
-        torch.manual_seed(3)
+    def test_two_groups_give_all_state_meta_gradients(self):
+        torch.manual_seed(6)
         block = self._make_block().train()
         with torch.no_grad():
             block.memory_gate.fill_(0.1)
@@ -230,14 +287,12 @@ class PerLayerMARSTest(unittest.TestCase):
         self.assertTrue(all(gradient is not None for gradient in gradients))
         self.assertTrue(all(torch.isfinite(gradient).all() for gradient in gradients))
         self.assertTrue(all(gradient.abs().sum() > 0 for gradient in gradients))
-        for token in (
-            block.state.encoder_mask_token,
-            block.state.decoder_mask_token,
-        ):
-            self.assertIsNotNone(token.grad)
-            self.assertGreater(token.grad.abs().sum().item(), 0.0)
+        self.assertIsNotNone(block.state.mask_token.grad)
+        self.assertGreater(block.state.mask_token.grad.abs().sum().item(), 0.0)
+        self.assertIsNotNone(block.lr_proj.weight.grad)
+        self.assertGreater(block.lr_proj.weight.grad.abs().sum().item(), 0.0)
 
-    def test_model_has_independent_state_per_layer_and_no_shared_state(self):
+    def test_model_has_independent_state_per_layer(self):
         model = VisionMARS(
             img_size=32,
             patch_size=16,
@@ -257,7 +312,7 @@ class PerLayerMARSTest(unittest.TestCase):
         self.assertEqual(output.shape, (1, 4))
 
     def test_full_scan_checkpoint_preserves_mask_rng_and_gradients(self):
-        torch.manual_seed(4)
+        torch.manual_seed(7)
         eager = self._make_block().train()
         checked = copy.deepcopy(eager)
         with torch.no_grad():
@@ -266,18 +321,10 @@ class PerLayerMARSTest(unittest.TestCase):
         eager_input = torch.randn(1, 2, 5, 12, requires_grad=True)
         checked_input = eager_input.detach().clone().requires_grad_(True)
 
-        torch.manual_seed(5)
-        eager_output = eager.forward_scan(
-            eager_input,
-            fw_update_group_size=1,
-            use_checkpoint=False,
-        )
-        torch.manual_seed(5)
-        checked_output = checked.forward_scan(
-            checked_input,
-            fw_update_group_size=1,
-            use_checkpoint=True,
-        )
+        torch.manual_seed(8)
+        eager_output = eager.forward_scan(eager_input, 1, use_checkpoint=False)
+        torch.manual_seed(8)
+        checked_output = checked.forward_scan(checked_input, 1, use_checkpoint=True)
         torch.testing.assert_close(checked_output, eager_output)
         eager_output.square().mean().backward()
         checked_output.square().mean().backward()
@@ -318,7 +365,7 @@ class PerLayerMARSTest(unittest.TestCase):
         return model
 
     def test_cross_layer_g2_matches_layer_major_output_and_gradients(self):
-        torch.manual_seed(7)
+        torch.manual_seed(9)
         layer_major = self._make_cross_layer_model().eval()
         layer_major.fw_update_layer_group_size = 1
         cross_layer = copy.deepcopy(layer_major)
@@ -344,7 +391,7 @@ class PerLayerMARSTest(unittest.TestCase):
                 )
 
     def test_cross_layer_checkpoint_preserves_mask_rng_and_gradients(self):
-        torch.manual_seed(8)
+        torch.manual_seed(10)
         eager = self._make_cross_layer_model().train()
         checked = copy.deepcopy(eager)
         checked.use_checkpoint = True
@@ -352,9 +399,9 @@ class PerLayerMARSTest(unittest.TestCase):
         eager_input = torch.randn(1, 3, 2, 32, 32, requires_grad=True)
         checked_input = eager_input.detach().clone().requires_grad_(True)
 
-        torch.manual_seed(9)
+        torch.manual_seed(11)
         eager_output = eager(eager_input)
-        torch.manual_seed(9)
+        torch.manual_seed(11)
         checked_output = checked(checked_input)
         torch.testing.assert_close(checked_output, eager_output)
         eager_output.square().mean().backward()

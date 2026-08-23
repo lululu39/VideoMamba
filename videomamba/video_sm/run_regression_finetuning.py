@@ -72,6 +72,9 @@ def get_args():
     )
     parser.add_argument('--muon_update_steps', type=int, default=5)
     parser.add_argument('--mars_mask_ratio', type=float, default=0.5)
+    parser.add_argument('--mars_cnn_dim', type=int, default=64)
+    parser.add_argument('--mars_tube_mask_fraction', type=float, default=0.5)
+    parser.add_argument('--mars_update_scale', type=float, default=0.03)
     parser.add_argument(
         '--mars_muon_backward',
         choices=('exact', 'straight_through', 'normalized_straight_through'),
@@ -467,6 +470,9 @@ def main(args, ds_init):
             fw_update_layer_group_size=args.fw_update_layer_group_size,
             muon_update_steps=args.muon_update_steps,
             mars_mask_ratio=args.mars_mask_ratio,
+            mars_cnn_dim=args.mars_cnn_dim,
+            mars_tube_mask_fraction=args.mars_tube_mask_fraction,
+            mars_update_scale=args.mars_update_scale,
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )
