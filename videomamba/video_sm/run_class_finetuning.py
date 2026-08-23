@@ -73,7 +73,13 @@ def get_args():
         ),
     )
     parser.add_argument('--muon_update_steps', type=int, default=5)
-    parser.add_argument('--mars_mask_ratio', type=float, default=0.5)
+    parser.add_argument('--mars_mask_ratio', type=float, default=0.75)
+    parser.add_argument(
+        '--mars_cnn_dim',
+        type=int,
+        default=64,
+        help='Fast CNN encoder/decoder bottleneck width for VideoMARS',
+    )
     parser.add_argument(
         '--mars_muon_backward',
         choices=('exact', 'straight_through', 'normalized_straight_through'),
@@ -479,13 +485,12 @@ def main(args, ds_init):
             mlp_ratio=args.mlp_ratio,
             kernel_size=args.tubelet_size,
             num_frames=args.num_frames,
-            fw_inter_multi=args.fw_inter_multi,
-            fw_num_heads=args.fw_num_heads,
             fw_base_lr=args.fw_base_lr,
             fw_update_group_size=args.fw_update_group_size,
             fw_update_layer_group_size=args.fw_update_layer_group_size,
             muon_update_steps=args.muon_update_steps,
             mars_mask_ratio=args.mars_mask_ratio,
+            mars_cnn_dim=args.mars_cnn_dim,
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )

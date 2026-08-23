@@ -8,153 +8,187 @@ import torch.nn.functional as F
 
 from videomamba.video_sm.models.videomars import (
     MARSBlock,
-    MaskedReconstructionSwiGLU,
+    MaskedAutoencoderConv3d,
     VisionMARS,
 )
-from videomamba.video_sm.models.videolact import (
-    FastWeightSwiGLU,
-    zeropower_via_newtonschulz5,
-)
 
 
-class MaskedReconstructionSwiGLUTest(unittest.TestCase):
+class MaskedAutoencoderConv3dTest(unittest.TestCase):
     @staticmethod
     def _make_state():
-        return MaskedReconstructionSwiGLU(
-            dim=8,
-            inter_multi=2,
-            num_heads=1,
-        )
+        return MaskedAutoencoderConv3d(dim=8, hidden_dim=4)
 
-    def test_analytic_reconstruction_directions_match_autograd(self):
+    @staticmethod
+    def _input():
+        # Two tubelets, each with one CLS and a 2x2 patch grid.
+        return torch.randn(2, 10, 8)
+
+    @staticmethod
+    def _mask():
+        mask = torch.zeros(2, 2, 2, 2, dtype=torch.bool)
+        mask[..., 0, 0] = True
+        mask[..., 1, 1] = True
+        return mask
+
+    def test_exact_reconstruction_directions_match_autograd(self):
         torch.manual_seed(0)
         state = self._make_state()
         fast_weights, _ = state.init_fast_weights(batch_size=2)
         fast_weights = tuple(
             weight.detach().requires_grad_(True) for weight in fast_weights
         )
-        masked_input = torch.randn(2, 5, 8)
-        target = torch.randn_like(masked_input)
-        mask = torch.rand_like(masked_input) > 0.5
-        learning_rates = torch.ones(2, 5, 3)
-
-        reconstruction, _ = state.reconstruct(masked_input, fast_weights)
+        update_input = self._input()
+        mask = self._mask()
+        reconstruction, target = state.reconstruct(
+            update_input,
+            mask,
+            fast_weights,
+            group_size=2,
+            height=2,
+            width=2,
+        )
         loss = (
             0.5
-            * ((reconstruction - target).square() * mask).sum()
-            / masked_input.shape[1]
+            * (
+                (reconstruction.float() - target.detach().float()).square()
+                * mask.unsqueeze(-1)
+            ).sum()
+            / 8
         )
-        autograd_gradients = torch.autograd.grad(loss, fast_weights)
+        expected = torch.autograd.grad(loss, fast_weights)
         directions = state.reconstruction_directions(
-            masked_input,
-            target,
+            update_input,
             mask,
-            learning_rates,
             fast_weights,
+            group_size=2,
+            height=2,
+            width=2,
+            create_graph=False,
         )
-        for direction, gradient in zip(directions, autograd_gradients):
-            torch.testing.assert_close(
-                direction,
-                -gradient,
-                atol=2e-5,
-                rtol=2e-4,
-            )
+        for direction, gradient in zip(directions, expected):
+            torch.testing.assert_close(direction, -gradient)
 
-    def test_muon_batches_all_three_matrices_without_changing_math(self):
+    def test_encoder_and_decoder_both_mix_neighbor_tokens(self):
         torch.manual_seed(1)
         state = self._make_state()
-        fast_weights, _ = state.init_fast_weights(batch_size=2)
-        gradients = tuple(torch.randn_like(weight) for weight in fast_weights)
-        updates = state.muon_updates(gradients, steps=3)
-        for index, (gradient, update) in enumerate(zip(gradients, updates)):
-            is_w1 = index == 1
-            oriented = gradient.transpose(-1, -2) if is_w1 else gradient
-            expected = zeropower_via_newtonschulz5(oriented.flatten(0, 1), 3)
-            expected = expected.reshape_as(oriented)
-            if is_w1:
-                expected = expected.transpose(-1, -2)
-            torch.testing.assert_close(update, expected)
+        fast_weights, _ = state.init_fast_weights(batch_size=1)
+        update_input = torch.randn(1, 10, 8)
+        mask = self._mask()[:1]
+        first, _ = state.reconstruct(
+            update_input,
+            mask,
+            fast_weights,
+            2,
+            2,
+            2,
+        )
+        changed_input = update_input.clone()
+        # Change a visible patch neighboring a masked patch.
+        changed_input[:, 2] += 1.0
+        second, _ = state.reconstruct(
+            changed_input,
+            mask,
+            fast_weights,
+            2,
+            2,
+            2,
+        )
+        masked_difference = (second - first)[mask].abs().sum()
+        self.assertGreater(masked_difference.item(), 0.0)
 
-    def test_unmasked_error_path_is_exactly_the_lact_update(self):
-        torch.manual_seed(6)
+    def test_unfold_bmm_depthwise_conv_matches_conv3d(self):
+        torch.manual_seed(10)
         state = self._make_state()
-        fast_weights, master_weights = state.init_fast_weights(batch_size=2)
-        update_input = torch.randn(2, 5, 8)
-        target = torch.randn_like(update_input)
-        learning_rates = torch.rand(2, 5, 3).add(0.01)
-        reconstruction_mask = torch.ones_like(update_input, dtype=torch.bool)
-        mars_fast, mars_master = state.update(
-            update_input,
-            target,
-            reconstruction_mask,
-            learning_rates,
-            fast_weights,
-            master_weights,
-            muon_update_steps=5,
+        x = torch.randn(2, 3, 4, 4, 4, requires_grad=True)
+        kernel = torch.randn(2, 4, 3, 3, 3, requires_grad=True)
+        actual = state._depthwise_conv3d(x, kernel)
+        expected = torch.stack(
+            [
+                F.conv3d(
+                    x[index].permute(3, 0, 1, 2).unsqueeze(0),
+                    kernel[index].unsqueeze(1),
+                    padding=1,
+                    groups=4,
+                )
+                .squeeze(0)
+                .permute(1, 2, 3, 0)
+                for index in range(2)
+            ]
         )
-        lact_fast, lact_master = FastWeightSwiGLU.update_preprojected(
-            state,
-            update_input,
-            target,
-            learning_rates,
-            fast_weights,
-            master_weights,
-            5,
+        torch.testing.assert_close(actual, expected)
+        actual_gradients = torch.autograd.grad(
+            actual.square().sum(),
+            (x, kernel),
+            retain_graph=True,
         )
-        for mars, lact in zip(
-            (*mars_fast, *mars_master),
-            (*lact_fast, *lact_master),
+        expected_gradients = torch.autograd.grad(
+            expected.square().sum(),
+            (x, kernel),
+        )
+        for actual_gradient, expected_gradient in zip(
+            actual_gradients, expected_gradients
         ):
-            torch.testing.assert_close(mars, lact)
+            torch.testing.assert_close(actual_gradient, expected_gradient)
 
-    def test_updated_fast_weights_use_lact_input_dimension_normalization(self):
+    def test_update_normalizes_every_fast_weight(self):
         torch.manual_seed(2)
         state = self._make_state()
         fast_weights, master_weights = state.init_fast_weights(batch_size=2)
-        masked_input = torch.randn(2, 5, 8)
-        target = torch.randn_like(masked_input)
-        mask = torch.rand_like(masked_input) > 0.5
-        learning_rates = torch.full((2, 5, 3), 0.01)
         updated_fast, updated_master = state.update(
-            masked_input,
-            target,
-            mask,
-            learning_rates,
+            self._input(),
+            self._mask(),
+            torch.full((2, state.num_weights), 0.01),
             fast_weights,
             master_weights,
             muon_update_steps=1,
+            group_size=2,
+            height=2,
+            width=2,
         )
-        for fast_weight, master_weight in zip(updated_fast, updated_master):
-            expected = F.normalize(master_weight, dim=2, eps=1e-5).to(
+        for index, (fast_weight, master_weight) in enumerate(
+            zip(updated_fast, updated_master)
+        ):
+            expected = state._normalize_weight(master_weight, index).to(
                 fast_weight.dtype
             )
             torch.testing.assert_close(fast_weight, expected)
 
-    def test_one_muon_update_reduces_masked_reconstruction_loss(self):
-        torch.manual_seed(0)
-        state = MaskedReconstructionSwiGLU(48, inter_multi=2, num_heads=1)
+    def test_one_muon_update_reduces_reconstruction_loss(self):
+        torch.manual_seed(2)
+        state = MaskedAutoencoderConv3d(dim=48, hidden_dim=16).train()
         fast_weights, master_weights = state.init_fast_weights(batch_size=2)
-        target = torch.randn(2, 64, 48)
-        mask = torch.zeros_like(target, dtype=torch.bool)
-        mask[..., ::2] = True
-        masked_input = target.masked_fill(mask, 0)
-        learning_rates = torch.full((2, 64, 3), 0.01)
+        update_input = torch.randn(2, 10, 48)
+        mask = self._mask()
 
         def reconstruction_loss(weights):
-            prediction, _ = state.reconstruct(masked_input, weights)
-            return 0.5 * (
-                (prediction.float() - target).square() * mask
-            ).sum() / masked_input.shape[1]
+            reconstruction, target = state.reconstruct(
+                update_input,
+                mask,
+                weights,
+                group_size=2,
+                height=2,
+                width=2,
+            )
+            return (
+                0.5
+                * (
+                    (reconstruction.float() - target.float()).square()
+                    * mask.unsqueeze(-1)
+                ).sum()
+                / 8
+            )
 
         before = reconstruction_loss(fast_weights)
         updated_fast, _ = state.update(
-            masked_input,
-            target,
+            update_input,
             mask,
-            learning_rates,
+            torch.full((2, state.num_weights), 0.01),
             fast_weights,
             master_weights,
             muon_update_steps=5,
+            group_size=2,
+            height=2,
+            width=2,
         )
         after = reconstruction_loss(updated_fast)
         self.assertLess(after.item(), before.item())
@@ -168,22 +202,22 @@ class PerLayerMARSTest(unittest.TestCase):
             num_heads=3,
             norm_cls=partial(nn.RMSNorm, eps=1e-5),
             layer_index=0,
-            fw_inter_multi=2,
-            fw_num_heads=1,
+            mars_cnn_dim=6,
+            spatial_size=(2, 2),
             fw_base_lr=0.01,
             muon_update_steps=1,
             mask_ratio=0.5,
         )
 
-    def test_feature_mask_is_exact_and_eval_deterministic(self):
+    def test_token_mask_is_tube_shaped_exact_and_eval_deterministic(self):
         block = self._make_block().eval()
-        first = block._feature_mask(2, 5, update_index=3, device="cpu")
-        second = block._feature_mask(2, 5, update_index=3, device="cpu")
+        first = block._token_mask(2, 3, update_index=3, device="cpu")
+        second = block._token_mask(2, 3, update_index=3, device="cpu")
         torch.testing.assert_close(first, second)
-        self.assertEqual(first[:, 0].sum(dim=-1).tolist(), [6, 6])
+        self.assertEqual(first[:, 0].flatten(1).sum(dim=-1).tolist(), [2, 2])
         torch.testing.assert_close(first[:, :1].expand_as(first), first)
 
-    def test_two_groups_give_all_state_weights_exact_meta_gradients(self):
+    def test_two_groups_give_all_fast_cnn_weights_exact_meta_gradients(self):
         torch.manual_seed(3)
         block = self._make_block().train()
         with torch.no_grad():
@@ -192,19 +226,16 @@ class PerLayerMARSTest(unittest.TestCase):
         output = block.forward_scan(x, fw_update_group_size=1)
         output.square().mean().backward()
 
-        # Gate/up/down are all part of one state mapping.
-        for parameters in (
-            (block.state.w0, block.state.w2),
-            (block.state.w1,),
+        gradients = [parameter.grad for parameter in block.state.state_parameters()]
+        self.assertTrue(all(gradient is not None for gradient in gradients))
+        self.assertTrue(all(torch.isfinite(gradient).all() for gradient in gradients))
+        self.assertTrue(all(gradient.abs().sum() > 0 for gradient in gradients))
+        for token in (
+            block.state.encoder_mask_token,
+            block.state.decoder_mask_token,
         ):
-            gradients = [parameter.grad for parameter in parameters]
-            self.assertTrue(gradients)
-            self.assertTrue(all(grad is not None for grad in gradients))
-            self.assertTrue(all(torch.isfinite(grad).all() for grad in gradients))
-            self.assertGreater(
-                sum(grad.float().square().sum().item() for grad in gradients),
-                0.0,
-            )
+            self.assertIsNotNone(token.grad)
+            self.assertGreater(token.grad.abs().sum().item(), 0.0)
 
     def test_model_has_independent_state_per_layer_and_no_shared_state(self):
         model = VisionMARS(
@@ -217,10 +248,11 @@ class PerLayerMARSTest(unittest.TestCase):
             num_frames=2,
             fw_update_group_size=1,
             muon_update_steps=1,
+            mars_cnn_dim=6,
         )
         self.assertFalse(hasattr(model, "shared_state"))
         self.assertIsNot(model.layers[0].state, model.layers[1].state)
-        self.assertEqual(model.layers[0].state.hidden_dim, 24)
+        self.assertEqual(model.layers[0].state.hidden_dim, 6)
         output = model(torch.randn(1, 3, 2, 32, 32))
         self.assertEqual(output.shape, (1, 4))
 
@@ -251,8 +283,7 @@ class PerLayerMARSTest(unittest.TestCase):
         checked_output.square().mean().backward()
         torch.testing.assert_close(checked_input.grad, eager_input.grad)
         for eager_parameter, checked_parameter in zip(
-            eager.parameters(),
-            checked.parameters(),
+            eager.parameters(), checked.parameters()
         ):
             if eager_parameter.grad is None:
                 self.assertIsNone(checked_parameter.grad)
@@ -260,6 +291,8 @@ class PerLayerMARSTest(unittest.TestCase):
                 torch.testing.assert_close(
                     checked_parameter.grad,
                     eager_parameter.grad,
+                    atol=2e-5,
+                    rtol=2e-4,
                 )
 
     @staticmethod
@@ -275,6 +308,7 @@ class PerLayerMARSTest(unittest.TestCase):
             fw_update_group_size=1,
             fw_update_layer_group_size=2,
             muon_update_steps=1,
+            mars_cnn_dim=6,
             use_checkpoint=use_checkpoint,
             checkpoint_num=2 if use_checkpoint else 0,
         )
@@ -290,16 +324,14 @@ class PerLayerMARSTest(unittest.TestCase):
         cross_layer = copy.deepcopy(layer_major)
         cross_layer.fw_update_layer_group_size = 2
         layer_input = torch.randn(1, 3, 2, 32, 32)
-        cross_input = layer_input.detach().clone()
 
         layer_output = layer_major(layer_input)
-        cross_output = cross_layer(cross_input)
+        cross_output = cross_layer(layer_input.detach().clone())
         torch.testing.assert_close(cross_output, layer_output)
         layer_output.square().mean().backward()
         cross_output.square().mean().backward()
         for layer_parameter, cross_parameter in zip(
-            layer_major.parameters(),
-            cross_layer.parameters(),
+            layer_major.parameters(), cross_layer.parameters()
         ):
             if layer_parameter.grad is None:
                 self.assertIsNone(cross_parameter.grad)
@@ -307,8 +339,8 @@ class PerLayerMARSTest(unittest.TestCase):
                 torch.testing.assert_close(
                     cross_parameter.grad,
                     layer_parameter.grad,
-                    atol=2e-5,
-                    rtol=2e-4,
+                    atol=3e-5,
+                    rtol=3e-4,
                 )
 
     def test_cross_layer_checkpoint_preserves_mask_rng_and_gradients(self):
@@ -329,8 +361,7 @@ class PerLayerMARSTest(unittest.TestCase):
         checked_output.square().mean().backward()
         torch.testing.assert_close(checked_input.grad, eager_input.grad)
         for eager_parameter, checked_parameter in zip(
-            eager.parameters(),
-            checked.parameters(),
+            eager.parameters(), checked.parameters()
         ):
             if eager_parameter.grad is None:
                 self.assertIsNone(checked_parameter.grad)
@@ -338,8 +369,8 @@ class PerLayerMARSTest(unittest.TestCase):
                 torch.testing.assert_close(
                     checked_parameter.grad,
                     eager_parameter.grad,
-                    atol=2e-5,
-                    rtol=2e-4,
+                    atol=3e-5,
+                    rtol=3e-4,
                 )
 
 

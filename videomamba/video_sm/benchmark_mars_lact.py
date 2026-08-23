@@ -32,6 +32,7 @@ def get_args():
     parser.add_argument("--warmup-steps", type=int, default=2)
     parser.add_argument("--measure-steps", type=int, default=5)
     parser.add_argument("--memory-gate", type=float, default=0.1)
+    parser.add_argument("--mars-cnn-dim", type=int, default=64)
     parser.add_argument("--checkpoint-num", type=int, default=32)
     return parser.parse_args()
 
@@ -47,7 +48,6 @@ def make_model(args):
         mlp_ratio=3.0,
         kernel_size=1,
         num_frames=args.num_frames,
-        fw_inter_multi=2,
         fw_update_group_size=args.fw_update_group_size,
         muon_update_steps=5,
         use_checkpoint=args.checkpoint_num > 0,
@@ -55,6 +55,7 @@ def make_model(args):
     )
     if args.model == "videolact_middle":
         common.update(
+            fw_inter_multi=2,
             fw_num_heads=1,
             fw_base_lr=0.01,
             fw_update_layer_group_size=args.layer_group_size,
@@ -63,9 +64,10 @@ def make_model(args):
         )
     else:
         common.update(
-            fw_num_heads=1,
             fw_base_lr=0.01,
             fw_update_layer_group_size=args.layer_group_size,
+            mars_cnn_dim=args.mars_cnn_dim,
+            mars_mask_ratio=0.75,
         )
     model = create_model(args.model, **common)
     with torch.no_grad():

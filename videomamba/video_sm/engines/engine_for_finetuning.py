@@ -33,12 +33,10 @@ def _mars_grad_group_norms(model):
         if parameter.grad is None:
             continue
         name = name.removeprefix("module.")
-        if name.startswith("layers.") and name.endswith(
-            (".state.w0", ".state.w2")
-        ):
-            group = "state_gate_up"
-        elif name.startswith("layers.") and name.endswith(".state.w1"):
-            group = "state_down"
+        if name.startswith("layers.") and ".state.encoder_" in name:
+            group = "state_encoder"
+        elif name.startswith("layers.") and ".state.decoder_" in name:
+            group = "state_decoder"
         elif name.startswith("layers.") and ".memory_norm." in name:
             group = "memory_norm"
         elif name.startswith("layers.") and name.endswith(".memory_gate"):
