@@ -116,6 +116,13 @@
   softmax attention -> convolutional masked-autoencoding fast state -> slow SwiGLU MLP。
   window attention、slow MLP 及相应 norm 的参数名、形状和执行位置继续与
   VideoViT/VideoLACT 相同，使 image VideoViT trunk 可以逐层初始化 MARS。
+- `--mars_no_fw` 是显式 fast-weight 消融：每层只执行 grouped window softmax
+  attention -> slow SwiGLU MLP，不构造 `memory_norm/state/memory_gate/lr_proj`，也不
+  计算 mask、reconstruction loss 或 recurrent update。此时 `fw_update_group_size` 只
+  定义 attention window 覆盖的连续 tubelet 数；F64/G8 为 8 个 1576-token window。
+  no-FW MARS 的参数键和形状与同配置 VideoViT 完全一致，但其 attention 是 grouped
+  local window 而不是 VideoViT 的 F64 full-sequence attention，因此它是隔离 FW 贡献的
+  window-ViT baseline，而不是标准 VideoViT baseline。
 - 每个 tubelet 仍为 `1 CLS + N spatial patches`，复用空间位置编码并叠加时间位置
   编码。`window_size == chunk_size == (N + 1) * fw_update_group_size`，分类/回归
   CLI 未显式设置 tubelet size 时默认用 1。分类读取最后一个 tubelet 的 CLS。
@@ -491,7 +498,25 @@
   `/mnt/localssd/experiments/videovit/video-mars-middle-k400-f64x224-no-ld-v4/`。
   首步含 data/compile warmup 为 57.63 秒；step 20--34 稳态约 `1.98--2.07 s/step`，
   PyTorch peak 32,476 MiB、`nvidia-smi` 约 36.5 GiB/卡，grad norm 约 3.11--3.15、
-  loss scale 65,536，无 OOM/NaN。guard 每 5 秒只保留 launcher 后代并在训练退出后自停。
+  loss scale 65,536，无 OOM/NaN。epoch 0/1 validation top-1 为 `33.685/47.706%`、
+  top-5 为 `60.797/73.323%`，train grad norm 为 `3.702/4.793`。2026-08-24 按用户要求在
+  epoch 2 step 1992/7513 停止 MARS 探索；training/guard tmux、launcher、8 个 rank 和
+  guard 均已退出，GPU 已释放。保留已有 checkpoint，但不得自动 resume。
+- pure grouped-window VideoViT 消融入口为
+  `videomamba/video_sm/exp/k400/videomars_middle/run_f64x224_no_ld_v4_nofw.sh`，run name
+  为 `video-mars-middle-k400-f64x224-no-ld-v4-nofw`。它与 v4 使用相同 ImageViT
+  checkpoint、F64/no-LD 训练 schedule、G8 window、32 层完整 checkpoint 和 W&B 设置，
+  但传入 `--mars_no_fw` 并完全移除 fast state、masked reconstruction 和 update；不要
+  传入或解释任何 MARS update/mask/cross-layer 超参。该 run 专门比较“grouped window
+  attention + slow MLP”和完整 LACT/MARS，用来隔离 recurrent FW 的增益。正式 run 于
+  2026-08-24 从 ImageViT best checkpoint 全新启动，公网 W&B 为
+  `https://wandb.ai/LVSM-Experiment/videosft/runs/6g5af9ov`；run/guard tmux session
+  分别为 run name 和追加 `-guard`，launcher/guard PID 为 `1114035`/`1128378`，日志和
+  PID 位于 `/mnt/localssd/experiments/videovit/video-mars-middle-k400-f64x224-no-ld-v4-nofw/`。
+  首步含 data/compile warmup 为 21.61 秒；step 26--70 实测约 `0.683 s/step`，step 83
+  的 20-step window meter 为 `0.648 s/step`，PyTorch peak 9,463 MiB、`nvidia-smi`
+  约 14,388 MiB/卡，grad norm 约 3.15、loss scale 65,536，无 OOM/NaN。guard 每 5 秒
+  只保留 launcher 后代并在训练退出后自停。
 
 ## Weights & Biases 规则
 
@@ -642,6 +667,13 @@
   harness 下 LACT private-proj G4 的 `1.635 s/step` 仍慢约 5.9%，且多用约 3.87 GiB
   allocated memory。这些数字不含 DDP、视频解码和 dataloader；两种 v4 配置都连续完成
   warmup 和 5 个 BF16 AdamW full steps，无 OOM/NaN。
+- no-FW 单元测试加入后当前 VideoMARS 共 15 项通过。no-FW MARS 与同规格 VideoViT 的
+  state-dict key/shape 完全相同，不存在任何 `state/memory/lr_proj` 参数；带 stochastic
+  depth 的整层 checkpoint 与 eager 在输出、输入梯度和全部参数梯度上逐值一致。
+  Middle/F64/G8/400 类参数量为 78,337,552；正式 ImageViT checkpoint 加载后仅缺预期的
+  `temporal_pos_embedding` 和 400 类 head，且无 unexpected key。单 H100 BF16、真实
+  F64/B8/G8/depth32、label smoothing、AdamW 和 32 层 checkpoint 的完整训练步稳态为
+  `0.4390 s/step`、`18.23 clips/s`、peak allocated/reserved `8.66/11.42 GiB`。
 
 ### VideoLACT/VideoViT 其他验证
 

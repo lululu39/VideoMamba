@@ -33,6 +33,7 @@ def get_args():
     parser.add_argument("--measure-steps", type=int, default=5)
     parser.add_argument("--memory-gate", type=float, default=0.1)
     parser.add_argument("--mars-cnn-dim", type=int, default=64)
+    parser.add_argument("--mars-no-fw", action="store_true")
     parser.add_argument("--checkpoint-num", type=int, default=32)
     return parser.parse_args()
 
@@ -70,6 +71,7 @@ def make_model(args):
             mars_mask_ratio=0.5,
             mars_tube_mask_fraction=0.5,
             mars_update_scale=0.03,
+            mars_no_fw=args.mars_no_fw,
         )
     model = create_model(args.model, **common)
     with torch.no_grad():

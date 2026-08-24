@@ -83,6 +83,11 @@ def get_args():
     parser.add_argument('--mars_tube_mask_fraction', type=float, default=0.5)
     parser.add_argument('--mars_update_scale', type=float, default=0.03)
     parser.add_argument(
+        '--mars_no_fw',
+        action='store_true',
+        help='Disable MARS fast-weight memory for a pure window-attention ViT ablation',
+    )
+    parser.add_argument(
         '--mars_muon_backward',
         choices=('exact', 'straight_through', 'normalized_straight_through'),
         default='normalized_straight_through',
@@ -495,6 +500,7 @@ def main(args, ds_init):
             mars_cnn_dim=args.mars_cnn_dim,
             mars_tube_mask_fraction=args.mars_tube_mask_fraction,
             mars_update_scale=args.mars_update_scale,
+            mars_no_fw=args.mars_no_fw,
             use_checkpoint=args.use_checkpoint,
             checkpoint_num=args.checkpoint_num,
         )

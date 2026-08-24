@@ -426,6 +426,7 @@ class MARSBlock(nn.Module):
         mask_ratio=0.5,
         tube_mask_fraction=0.5,
         update_scale=0.03,
+        no_fw=False,
         norm_epsilon=1e-5,
         device=None,
         dtype=None,
@@ -451,6 +452,7 @@ class MARSBlock(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.dim = dim
         self.layer_index = int(layer_index)
+        self.no_fw = bool(no_fw)
         self.mask_ratio = float(mask_ratio)
         self.tube_mask_fraction = float(tube_mask_fraction)
         self.update_scale = float(update_scale)
@@ -478,25 +480,28 @@ class MARSBlock(nn.Module):
         self.drop_path = (
             TensorDropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         )
-        self.memory_norm = norm_cls(dim, **factory_kwargs)
-        self.state = MaskedResidualDenoiserConv3d(
-            dim,
-            hidden_dim=mars_cnn_dim,
-            norm_epsilon=norm_epsilon,
-            **factory_kwargs,
-        )
-        self.memory_gate = nn.Parameter(torch.zeros(dim, **factory_kwargs))
-        self.lr_proj = nn.Linear(
-            dim,
-            1,
-            bias=False,
-            **factory_kwargs,
-        )
-        self.base_lr_inverse = inverse_softplus(fw_base_lr)
+        if not self.no_fw:
+            self.memory_norm = norm_cls(dim, **factory_kwargs)
+            self.state = MaskedResidualDenoiserConv3d(
+                dim,
+                hidden_dim=mars_cnn_dim,
+                norm_epsilon=norm_epsilon,
+                **factory_kwargs,
+            )
+            self.memory_gate = nn.Parameter(torch.zeros(dim, **factory_kwargs))
+            self.lr_proj = nn.Linear(
+                dim,
+                1,
+                bias=False,
+                **factory_kwargs,
+            )
+            self.base_lr_inverse = inverse_softplus(fw_base_lr)
         self.norm_mlp = norm_cls(dim, **factory_kwargs)
         self.mlp = SwiGLUMLP(dim, mlp_ratio=mlp_ratio, **factory_kwargs)
 
     def init_fast_weights(self, batch_size):
+        if self.no_fw:
+            raise RuntimeError("Fast weights are disabled for this MARS block")
         return self.state.init_fast_weights(batch_size)
 
     def _attend_flat_windows(self, x):
@@ -538,6 +543,33 @@ class MARSBlock(nn.Module):
         if x.is_cuda:
             return self._compiled_window_attention(x, window_group_size)
         return self._apply_window_attention(x, window_group_size)
+
+    def _forward_no_fw(self, x, window_group_size):
+        """Apply grouped window attention and the slow MLP without memory."""
+        x = self.apply_window_attention(x, window_group_size)
+        batch_size, tubelets, seq_len, dim = x.shape
+        flat_x = x.reshape(batch_size * tubelets, seq_len, dim)
+        slow_output = self.mlp(
+            self.norm_mlp(flat_x.to(dtype=self.norm_mlp.weight.dtype))
+        )
+        x = x + self.drop_path(slow_output).reshape_as(x)
+        return x.float() if self.residual_in_fp32 else x
+
+    def forward_no_fw(self, x, window_group_size, use_checkpoint=False):
+        if not self.no_fw:
+            raise RuntimeError("forward_no_fw requires a no-FW MARS block")
+        if not use_checkpoint:
+            return self._forward_no_fw(x, window_group_size)
+
+        def checkpointed_block(layer_input):
+            return self._forward_no_fw(layer_input, window_group_size)
+
+        return checkpoint.checkpoint(
+            checkpointed_block,
+            x,
+            preserve_rng_state=True,
+            use_reentrant=False,
+        )
 
     def _apply_memory_mlp_chunk(self, x, *fast_weights):
         batch_size, group_size, seq_len, dim = x.shape
@@ -838,6 +870,7 @@ class VisionMARS(nn.Module):
         mars_mask_ratio=0.5,
         mars_tube_mask_fraction=0.5,
         mars_update_scale=0.03,
+        mars_no_fw=False,
         device=None,
         dtype=None,
         use_checkpoint=False,
@@ -867,6 +900,7 @@ class VisionMARS(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         self.use_checkpoint = use_checkpoint
         self.checkpoint_num = checkpoint_num
+        self.mars_no_fw = bool(mars_no_fw)
         self.num_classes = num_classes
         self.d_model = self.num_features = self.embed_dim = embed_dim
         self.patch_embed = PatchEmbed(
@@ -932,6 +966,7 @@ class VisionMARS(nn.Module):
                     mask_ratio=mars_mask_ratio,
                     tube_mask_fraction=mars_tube_mask_fraction,
                     update_scale=mars_update_scale,
+                    no_fw=self.mars_no_fw,
                     norm_epsilon=norm_epsilon,
                     **factory_kwargs,
                 )
@@ -939,11 +974,12 @@ class VisionMARS(nn.Module):
             ]
         )
         self.norm_f = norm_cls(embed_dim, **factory_kwargs)
-        self.register_buffer(
-            "_layer_indices",
-            torch.arange(depth, dtype=torch.int64),
-            persistent=False,
-        )
+        if not self.mars_no_fw:
+            self.register_buffer(
+                "_layer_indices",
+                torch.arange(depth, dtype=torch.int64),
+                persistent=False,
+            )
 
         self.apply(_base_init)
         trunc_normal_(self.pos_embed, std=0.02)
@@ -956,8 +992,9 @@ class VisionMARS(nn.Module):
         )
         # Preserve the pretrained VideoViT function at initialization. The
         # gate learns first; state meta-gradients appear as it opens.
-        for layer in self.layers:
-            nn.init.zeros_(layer.memory_gate)
+        if not self.mars_no_fw:
+            for layer in self.layers:
+                nn.init.zeros_(layer.memory_gate)
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -1335,7 +1372,16 @@ class VisionMARS(nn.Module):
         x = x + self.temporal_pos_embedding.unsqueeze(2)
         x = self.pos_drop(x)
 
-        if self.fw_update_layer_group_size == 1:
+        if self.mars_no_fw:
+            for index, layer in enumerate(self.layers):
+                x = layer.forward_no_fw(
+                    x,
+                    self.fw_update_group_size,
+                    use_checkpoint=(
+                        self.use_checkpoint and index < self.checkpoint_num
+                    ),
+                )
+        elif self.fw_update_layer_group_size == 1:
             for index, layer in enumerate(self.layers):
                 x = layer.forward_scan(
                     x,

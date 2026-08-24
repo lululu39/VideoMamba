@@ -11,6 +11,7 @@ from videomamba.video_sm.models.videomars import (
     MaskedResidualDenoiserConv3d,
     VisionMARS,
 )
+from videomamba.video_sm.models.videovit import VisionTransformer
 
 
 class MaskedResidualDenoiserConv3dTest(unittest.TestCase):
@@ -310,6 +311,70 @@ class PerLayerMARSTest(unittest.TestCase):
         self.assertEqual(model.layers[0].state.hidden_dim, 6)
         output = model(torch.randn(1, 3, 2, 32, 32))
         self.assertEqual(output.shape, (1, 4))
+
+    def test_no_fw_model_is_parameter_identical_to_videovit(self):
+        common = dict(
+            img_size=32,
+            patch_size=16,
+            depth=2,
+            embed_dim=12,
+            num_heads=3,
+            num_classes=4,
+            num_frames=2,
+            kernel_size=1,
+        )
+        model = VisionMARS(
+            **common,
+            fw_update_group_size=1,
+            mars_no_fw=True,
+        )
+        vit = VisionTransformer(**common)
+        model_state = model.state_dict()
+        vit_state = vit.state_dict()
+        self.assertEqual(model_state.keys(), vit_state.keys())
+        for name in model_state:
+            self.assertEqual(model_state[name].shape, vit_state[name].shape)
+        parameter_names = dict(model.named_parameters())
+        self.assertFalse(any(".state." in name for name in parameter_names))
+        self.assertFalse(any("memory" in name for name in parameter_names))
+        self.assertFalse(any("lr_proj" in name for name in parameter_names))
+        output = model(torch.randn(1, 3, 2, 32, 32))
+        self.assertEqual(output.shape, (1, 4))
+
+    def test_no_fw_checkpoint_matches_eager_with_stochastic_depth(self):
+        torch.manual_seed(12)
+        eager = MARSBlock(
+            dim=12,
+            num_heads=3,
+            norm_cls=partial(nn.RMSNorm, eps=1e-5),
+            layer_index=0,
+            drop_path=0.2,
+            spatial_size=(2, 2),
+            no_fw=True,
+        ).train()
+        checked = copy.deepcopy(eager)
+        eager_input = torch.randn(2, 3, 5, 12, requires_grad=True)
+        checked_input = eager_input.detach().clone().requires_grad_(True)
+
+        torch.manual_seed(13)
+        eager_output = eager.forward_no_fw(eager_input, 2, use_checkpoint=False)
+        torch.manual_seed(13)
+        checked_output = checked.forward_no_fw(
+            checked_input,
+            2,
+            use_checkpoint=True,
+        )
+        torch.testing.assert_close(checked_output, eager_output)
+        eager_output.square().mean().backward()
+        checked_output.square().mean().backward()
+        torch.testing.assert_close(checked_input.grad, eager_input.grad)
+        for eager_parameter, checked_parameter in zip(
+            eager.parameters(), checked.parameters()
+        ):
+            torch.testing.assert_close(
+                checked_parameter.grad,
+                eager_parameter.grad,
+            )
 
     def test_full_scan_checkpoint_preserves_mask_rng_and_gradients(self):
         torch.manual_seed(7)
